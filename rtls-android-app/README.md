@@ -1,93 +1,55 @@
 # RTLS Native Android App
 
-Standalone **Android application** for offline-first location sync. When you build only this app, only this project and its dependency (rtls-kmp) are built. The rest of the repo (Swift package, React Native, Flutter, backend, dashboard) is not used by Gradle. Uses the shared [rtls-kmp](https://github.com/devzahirul/Offline_first_location_sync_iOS/tree/main/rtls-kmp) module for persistence, batching, and upload; provides a minimal UI to configure the backend, start/stop tracking, flush pending data, and display sync status.
+**Reference Android client** for the Real-Time Location Sync backend. Standalone Kotlin app that consumes the rtls-kmp library—single Activity, ViewBinding, FusedLocationProvider/LocationManager fallback, and a minimal config + status UI.
 
 ---
 
-## Overview
+## Architecture
 
-- **Role:** Reference Android client for the Real-Time Location Sync backend. Demonstrates integration of the KMP sync engine with FusedLocationProvider, permission handling, and a simple settings + status screen.
-- **Backend:** Same API as iOS and Flutter clients: `POST /v1/locations/batch` (Bearer token), optional `GET /v1/locations/latest`, optional WebSocket `/v1/ws`.
-- **Architecture:** Single-Activity app; View-based UI (XML layouts). Config (base URL, userId, deviceId, token) is applied once; tracking and flush are driven by the KMP `LocationSyncClient` and event flow.
+Single-Activity app with a Gradle subproject dependency on `rtls-kmp`. The KMP library owns persistence (SQLite), batching, retry, retention, and network gating; the app wires `LocationSyncClient` and `SyncEngine` to Android location APIs and a simple UI.
+
+| Layer | Responsibility |
+|-------|----------------|
+| **MainActivity** | Config (baseUrl, userId, deviceId, token), Start/Stop, Flush Now, permission flow, event collection via `SharedFlow` |
+| **LocationSyncClient** | Consumes `Flow<LocationPoint>`, inserts into store, notifies `SyncEngine`, exposes `events: SharedFlow<LocationSyncClientEvent>` |
+| **SyncEngine** | Mutex-serialized flush loop; `BatchingPolicy` (batch size, interval, max age), `SyncRetryPolicy` (exponential backoff), `RetentionPolicy` (sent-point pruning), `AndroidNetworkMonitor` (online gate) |
+| **AndroidLocationProvider** | `FusedLocationProviderClient` on API 28+, `LocationManager` fallback on API ≤28 |
 
 ---
 
 ## Features
 
-- **Configuration:** Base URL, User ID, Device ID, and access token; persisted for the session and used to create the KMP client.
-- **Tracking:** Start / Stop tracking; location is collected via KMP’s `AndroidLocationProvider` and written to SQLite; sync engine runs in the background.
-- **Flush:** “Flush now” triggers an immediate upload of pending points (within engine policy).
-- **Status:** Pending count and last sync/recorded event displayed on the main screen; updates from the client’s event stream.
-- **Permissions:** Requests `ACCESS_FINE_LOCATION`, `ACCESS_COARSE_LOCATION`, and `ACCESS_BACKGROUND_LOCATION` (Android 10+); runtime permission flow before starting tracking.
+- **Config:** baseUrl, userId, deviceId, token—applied once via Configure; used to instantiate `RTLSKmp.createLocationSyncClient()`.
+- **Tracking:** Start/Stop; location collected via `RTLSKmp.createLocationFlow()` (Fused or LocationManager), fed into `LocationSyncClient.startCollectingLocation()`.
+- **Flush:** "Flush now" calls `client.flushNow()` for immediate upload within engine policy.
+- **Status:** Pending count and last event from `client.stats()` and `client.events`.
+- **Permissions:** Runtime request for `ACCESS_FINE_LOCATION`, `ACCESS_COARSE_LOCATION`, `ACCESS_BACKGROUND_LOCATION` (Android 10+); requested before tracking.
+
+**Event stream (`LocationSyncClient.events`):** `Recorded`, `SyncEvent` (wraps `UploadSuccess(accepted, rejected)` / `UploadFailed(message)`), `Error`, `TrackingStarted`, `TrackingStopped`.
 
 ---
 
-## Technology stack
+## Build & Run
 
-| Concern | Technology |
-|---------|------------|
-| **Language** | Kotlin 1.9 |
-| **Build** | Gradle Kotlin DSL; AGP 8.2 |
-| **Min SDK** | 21 |
-| **UI** | XML layouts, ViewBinding; single Activity |
-| **Sync** | rtls-kmp (subproject): SQLite, OkHttp, FusedLocationProvider, Coroutines |
-| **Concurrency** | Coroutines; Main dispatcher for UI updates |
-
----
-
-## Build and run
-
-### Prerequisites
-
-- Android SDK (API 21+); Android Studio or CLI.
-- **rtls-kmp** must be available as a sibling project or at the path referenced in `settings.gradle.kts`.
-
-### Commands
+**Prerequisites:** Android SDK (API 21+). `rtls-kmp` must be a sibling project (`../rtls-kmp`) or path-adjusted in `settings.gradle.kts`.
 
 ```bash
 cd rtls-android-app
 ./gradlew assembleDebug
-./gradlew installDebug   # install on connected device/emulator
+./gradlew installDebug
 ```
 
-Or open the project in Android Studio and run the `app` configuration.
+Or open in Android Studio and run the `app` configuration.
 
-### First run
-
-1. **Configure:** Enter Base URL (e.g. `http://10.0.2.2:3000` for emulator, or `http://<host-ip>:3000` for a physical device on the same network), User ID, Device ID, and access token. Tap **Configure**.
-2. **Permissions:** When prompted, grant location (and background location if required).
-3. **Start:** Tap **Start** to begin collecting and syncing location. Use **Flush now** to force an immediate upload. **Stop** ends collection and stops the sync engine from processing new points.
-4. **Status:** Pending count and last event update as events are received from the KMP client.
+**First run:** Configure baseUrl (e.g. `http://10.0.2.2:3000` for emulator), userId, deviceId, token → grant location permissions → Start tracking → Flush Now for immediate upload. Pending count and last event update from the event stream.
 
 ---
 
-## Project structure
+## Integration Notes
 
-| Path | Purpose |
-|------|----------|
-| `settings.gradle.kts` | Includes `:app` and `:rtls-kmp` (projectDir → `../rtls-kmp`) |
-| `app/build.gradle.kts` | Application module; `implementation(project(":rtls-kmp"))` |
-| `app/src/main/AndroidManifest.xml` | Location permissions; single Activity |
-| `app/src/main/java/.../MainActivity.kt` | Config, start/stop/flush, event collection, permission request, UI refresh |
-| `app/src/main/res/layout/activity_main.xml` | Inputs for URL, userId, deviceId, token; buttons; status text |
-
----
-
-## Dependency on rtls-kmp
-
-The app expects the KMP module at `../rtls-kmp` relative to `rtls-android-app`. If you move the repo layout, update `settings.gradle.kts`:
-
-```kotlin
-project(":rtls-kmp").projectDir = file("<path-to-rtls-kmp>")
-```
-
----
-
-## Backend and network
-
-- Ensure the backend is running (see [backend-nodejs/README.md](../backend-nodejs/README.md)).
-- Emulator: use `http://10.0.2.2:3000` to reach the host’s loopback.
-- Physical device: use the host machine’s LAN IP and ensure the backend listens on `0.0.0.0` (e.g. `HOST=0.0.0.0` in `.env`).
+- **Subproject:** `implementation(project(":rtls-kmp"))`; `project(":rtls-kmp").projectDir = file("../rtls-kmp")`. Adjust path if repo layout changes.
+- **Backend:** Same API as iOS/Flutter: `POST /v1/locations/batch` (Bearer token). Emulator: `http://10.0.2.2:3000`; physical device: host LAN IP, backend on `0.0.0.0`.
+- **Min SDK 21, target 34.**
 
 ---
 

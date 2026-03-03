@@ -9,12 +9,30 @@ class RTLSyncConfig {
   final String userId;
   final String deviceId;
   final String accessToken;
+  /// Time-based: update interval in seconds (e.g. 360 for 6 min). Applied on Android; iOS uses RTLSyncKit defaults.
+  final double? locationIntervalSeconds;
+  /// Distance-based: min distance in meters between updates. If set with interval, distance is used.
+  final double? locationDistanceMeters;
+  /// If true, use ~500 m / less frequent updates (significant-change style).
+  final bool useSignificantLocationOnly;
+  /// Max points per upload batch (Android KMP; iOS uses RTLSyncKit BatchingPolicy). Default 50.
+  final int? batchMaxSize;
+  /// Flush interval in seconds (Android KMP). Default 10.
+  final double? flushIntervalSeconds;
+  /// Flush when oldest pending point is older than this many seconds (Android KMP). Default 60.
+  final double? maxBatchAgeSeconds;
 
   const RTLSyncConfig({
     required this.baseUrl,
     required this.userId,
     required this.deviceId,
     required this.accessToken,
+    this.locationIntervalSeconds,
+    this.locationDistanceMeters,
+    this.useSignificantLocationOnly = false,
+    this.batchMaxSize,
+    this.flushIntervalSeconds,
+    this.maxBatchAgeSeconds,
   });
 
   Map<String, dynamic> toMap() => {
@@ -22,6 +40,12 @@ class RTLSyncConfig {
         'userId': userId,
         'deviceId': deviceId,
         'accessToken': accessToken,
+        'locationIntervalSeconds': locationIntervalSeconds,
+        'locationDistanceMeters': locationDistanceMeters,
+        'useSignificantLocationOnly': useSignificantLocationOnly,
+        'batchMaxSize': batchMaxSize,
+        'flushIntervalSeconds': flushIntervalSeconds,
+        'maxBatchAgeSeconds': maxBatchAgeSeconds,
       };
 }
 

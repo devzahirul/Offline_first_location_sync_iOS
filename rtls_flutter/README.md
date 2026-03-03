@@ -1,199 +1,173 @@
 # rtls_flutter
 
-**Flutter plugin** for offline-first real-time location sync. Exposes a single Dart API; on **Android** the implementation delegates to the shared [rtls-kmp](../rtls-kmp/README.md) module; on **iOS** it delegates to the Swift [RTLSyncKit](https://github.com/devzahirul/Offline_first_location_sync_iOS) package. Both sides use the same backend: `POST /v1/locations/batch`, optional `GET /v1/locations/latest`, and optional WebSocket `/v1/ws`.
+Cross-platform Flutter plugin delivering **offline-first, battery-aware location sync** over a single Dart API. Android is backed by a shared Kotlin Multiplatform sync engine ([rtls-kmp](../rtls-kmp/README.md)); iOS delegates to the native Swift [RTLSyncKit](https://github.com/devzahirul/Offline_first_location_sync_iOS) package. Both converge on the same backend contract — `POST /v1/locations/batch`, `GET /v1/locations/latest`, WebSocket `/v1/ws` — so the host app never thinks about platform differences.
 
 ---
 
-## Overview
+## Architecture
 
-- **Contract:** Configure once (base URL, userId, deviceId, access token); then start/stop tracking, get pending stats, flush immediately, and subscribe to an event stream (recorded, sync, error, tracking started/stopped).
-- **Android:** Plugin’s native code depends on the KMP library. The **host app** must include the `rtls-kmp` project in its Gradle settings and declare the dependency so the plugin can resolve it.
-- **iOS:** Plugin’s native code imports RTLSyncKit. The **host app** must add the RTLSyncKit Swift package in Xcode and link it to the app target.
-- **Channels:** MethodChannel for one-shot calls (configure, startTracking, stopTracking, getStats, flushNow, requestAlwaysAuthorization); EventChannel for the continuous event stream.
-
-When you add only this Flutter plugin, only this plugin’s code (lib/, android/, ios/) is used. On iOS you add the RTLSyncKit Swift package separately in Xcode; on Android you include the rtls-kmp Gradle project. The rest of the repo (React Native, native Android app, backend, dashboard) is not part of the plugin.
-
----
-
-## Adding the plugin to your app
-
-### 1. Dependency
-
-In your Flutter app’s `pubspec.yaml`:
-
-```yaml
-dependencies:
-  flutter:
-    sdk: flutter
-  rtls_flutter:
-    path: ../rtls_flutter   # adjust path to this repo
-    # or git:
-    #   url: https://github.com/your-org/your-repo.git
-    #   path: rtls_flutter
+```
+┌─────────────────────────────────────────────────┐
+│                  Dart (Host App)                 │
+│  RTLSync.configure ─ startTracking ─ stopTracking│
+│  getStats ─ flushNow ─ requestAlwaysAuthorization│
+│  RTLSync.events (Stream<Map>)                    │
+├────────────┬────────────────────────┬────────────┤
+│MethodChannel│       EventChannel    │            │
+├────────────┴────────────────────────┴────────────┤
+│  Android (Kotlin)            │  iOS (Swift)      │
+│  → rtls-kmp SyncEngine       │  → RTLSyncKit     │
+│  → ForegroundService         │  → CLLocationMgr  │
+│    (FOREGROUND_SERVICE_TYPE  │  → CoreLocation    │
+│     _LOCATION)               │    significant /   │
+│  → ActivityCompat perms      │    standard visits │
+└──────────────────────────────┴───────────────────┘
 ```
 
-Then run:
-
-```bash
-flutter pub get
-```
-
----
-
-## Android setup
-
-### 1. Include the KMP module
-
-The plugin’s Android implementation uses `implementation project(':rtls_kmp')` (or `:rtls-kmp` depending on how you name the project). The **host app** must include that project in its Gradle build.
-
-In the host app’s **`android/settings.gradle`** or **`android/settings.gradle.kts`**, add (path relative to the host’s `android/` directory):
-
-**Groovy (`settings.gradle`):**
-
-```groovy
-include ':app'
-include ':rtls_kmp'
-project(':rtls_kmp').projectDir = file('<path-to-rtls-kmp>')
-```
-
-**Kotlin DSL (`settings.gradle.kts`):**
-
-```kotlin
-include(":app")
-include(":rtls_kmp")
-project(":rtls_kmp").projectDir = file("<path-to-rtls-kmp>")
-```
-
-Example: repo layout `your_repo/rtls-kmp` and `your_repo/your_flutter_app/android/` → use `file("../../rtls-kmp")`.
-
-### 2. Permissions
-
-In **`android/app/src/main/AndroidManifest.xml`**:
-
-```xml
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
-    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
-    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
-    <uses-permission android:name="android.permission.ACCESS_BACKGROUND_LOCATION" />
-    <application ...>
-```
-
-Request location (and background location if needed) at runtime before calling `startTracking()`; use `permission_handler` or platform APIs as appropriate.
-
-### 3. Build
-
-```bash
-flutter run
-# or
-flutter build apk
-flutter build appbundle
-```
-
----
-
-## iOS setup
-
-### 1. Link RTLSyncKit
-
-The plugin’s iOS code imports RTLSyncKit. The app target must link the Swift package.
-
-1. Open the app’s iOS project in Xcode:  
-   `open ios/Runner.xcworkspace` (or your `.xcworkspace`).
-2. **File → Add Package Dependencies…**
-3. Add the package that contains `Package.swift` (this repo root, or the Git URL).
-4. Add the **RTLSyncKit** library to the **Runner** (or main app) target:  
-   Target → **General → Frameworks, Libraries, and Embedded Content** → **+** → **RTLSyncKit**.
-
-### 2. Location usage strings
-
-In **`ios/Runner/Info.plist`** (or the app’s Info.plist):
-
-```xml
-<key>NSLocationWhenInUseUsageDescription</key>
-<string>This app uses location to record and sync your position.</string>
-<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
-<string>This app uses location in the background to sync your position.</string>
-```
-
-Request authorization at runtime (e.g. `RTLSync.requestAlwaysAuthorization()` or CoreLocation) before starting tracking.
-
-### 3. Build
-
-```bash
-flutter run
-# or
-flutter build ios
-```
+**MethodChannel** handles one-shot calls (`configure`, `startTracking`, `stopTracking`, `getStats`, `flushNow`, `requestAlwaysAuthorization`). **EventChannel** delivers a continuous event stream back to Dart. The plugin implements `ActivityAware` on Android so permission requests route through `ActivityCompat` with the correct `Activity` reference.
 
 ---
 
 ## Dart API
 
-### Import
-
 ```dart
 import 'package:rtls_flutter/rtls_flutter.dart';
 ```
 
-### Configure (once)
+### RTLSyncConfig
+
+| Parameter | Type | Purpose |
+|-----------|------|---------|
+| `baseUrl` | `String` | Backend root (no trailing slash) |
+| `userId` | `String` | Logical user identifier |
+| `deviceId` | `String` | Per-device identifier |
+| `accessToken` | `String` | JWT / bearer token for `Authorization` header |
+| `locationIntervalSeconds` | `int?` | Time-based capture interval (Android) |
+| `locationDistanceMeters` | `double?` | Distance-based capture threshold (Android) |
+| `useSignificantLocationOnly` | `bool?` | ~500 m / battery-optimized mode |
+| `batchMaxSize` | `int?` | Max points per upload batch |
+| `flushIntervalSeconds` | `int?` | Automatic flush cadence |
+| `maxBatchAgeSeconds` | `int?` | Force-flush threshold for stale batches |
+
+### Core Methods
 
 ```dart
 await RTLSync.configure(RTLSyncConfig(
-  baseUrl: 'https://your-api.example.com',  // no trailing slash
+  baseUrl: 'https://api.example.com',
   userId: 'user-123',
   deviceId: 'device-456',
-  accessToken: 'your-jwt-or-token',
+  accessToken: 'jwt-token',
+  locationIntervalSeconds: 360,
+  batchMaxSize: 50,
+  flushIntervalSeconds: 30,
+  maxBatchAgeSeconds: 120,
 ));
-```
 
-### Tracking
-
-```dart
-await RTLSync.startTracking();
-// ...
-await RTLSync.stopTracking();
-```
-
-### Background location (iOS)
-
-```dart
 await RTLSync.requestAlwaysAuthorization();
-// then startTracking() when authorized
-```
+await RTLSync.startTracking();
+await RTLSync.stopTracking();
 
-### Stats and flush
-
-```dart
 final stats = await RTLSync.getStats();
 // stats.pendingCount, stats.oldestPendingRecordedAtMs
+
 await RTLSync.flushNow();
 ```
 
-### Event stream
+### Event Stream
 
 ```dart
 RTLSync.events.listen((Map<dynamic, dynamic> event) {
-  final type = event['type'];  // e.g. 'recorded', 'syncEvent', 'error', 'trackingStarted', 'trackingStopped'
-  // event may contain 'point', 'message', 'event', etc.
+  switch (event['type']) {
+    case 'recorded':
+      // Full point: lat, lng, accuracy, altitude, speed, course, recordedAt
+    case 'syncEvent':
+      // uploadSucceeded → accepted/rejected counts
+      // uploadFailed   → error message
+    case 'error':
+      // Runtime error description
+    case 'trackingStarted':
+    case 'trackingStopped':
+  }
 });
+```
+
+Events mirror RTLSyncKit semantics: `recorded` carries the full location point (horizontal accuracy, altitude, speed, course); `syncEvent` distinguishes `uploadSucceeded` (with `accepted` / `rejected` counts) from `uploadFailed` (with a human-readable `message`).
+
+---
+
+## Android Integration
+
+### 1. Include rtls-kmp in the host app's Gradle build
+
+The plugin's Android layer resolves `rtls-kmp` as a project dependency. The host app must surface it.
+
+**settings.gradle.kts**
+
+```kotlin
+include(":rtls_kmp")
+project(":rtls_kmp").projectDir = file("../../rtls-kmp") // adjust relative path
+```
+
+### 2. Manifest permissions
+
+The plugin's own `AndroidManifest.xml` declares:
+
+```xml
+<uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+<uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+<uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+<uses-permission android:name="android.permission.ACCESS_BACKGROUND_LOCATION" />
+<uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+<uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
+```
+
+Runtime permission requests are handled by the plugin via `ActivityCompat`. The plugin is `ActivityAware`, binding to the host `Activity` lifecycle for correct permission callback routing.
+
+### 3. Foreground service
+
+Tracking launches an Android foreground service typed as `FOREGROUND_SERVICE_TYPE_LOCATION`, ensuring location updates continue when the app is backgrounded. `LocationRequestParams` (interval, distance, significant-only) are derived from the `RTLSyncConfig` passed at configure time.
+
+---
+
+## iOS Integration
+
+### 1. Link RTLSyncKit
+
+1. Open `ios/Runner.xcworkspace` in Xcode.
+2. **File → Add Package Dependencies…** → add the repo root (or Git URL) containing `Package.swift`.
+3. Link the **RTLSyncKit** library to the **Runner** target under General → Frameworks, Libraries, and Embedded Content.
+
+### 2. Info.plist usage strings
+
+```xml
+<key>NSLocationWhenInUseUsageDescription</key>
+<string>Records your location for real-time sync.</string>
+<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
+<string>Continues location recording in the background.</string>
+```
+
+### 3. Build
+
+```bash
+flutter run          # or flutter build ios
 ```
 
 ---
 
-## Summary
+## Platform Summary
 
-| Platform | Requirements |
-|----------|--------------|
-| **Android** | 1) Add `rtls_flutter` dependency. 2) Include `rtls_kmp` in `android/settings.gradle` (or `.kts`) with correct path. 3) Declare location permissions and request at runtime. |
-| **iOS** | 1) Add `rtls_flutter` dependency. 2) Add RTLSyncKit Swift package in Xcode and link to app target. 3) Add location usage strings and request authorization. |
-
-Then use `RTLSync.configure()`, `startTracking()`, `stopTracking()`, `getStats()`, `flushNow()`, `requestAlwaysAuthorization()`, and `RTLSync.events` from Dart on both platforms.
+| | Android | iOS |
+|---|---------|-----|
+| **Engine** | rtls-kmp (Kotlin Multiplatform) | RTLSyncKit (Swift) |
+| **Background** | Foreground service (`FOREGROUND_SERVICE_TYPE_LOCATION`) | CLLocationManager always-authorization |
+| **Host Setup** | Include `:rtls_kmp` in `settings.gradle`; permissions in manifest | Link RTLSyncKit Swift package in Xcode; Info.plist strings |
+| **Permission API** | `ActivityCompat` via `ActivityAware` plugin | `requestAlwaysAuthorization()` bridged through MethodChannel |
 
 ---
 
-## Example app
+## Example App
 
-See [example/README.md](example/README.md) for a minimal Flutter app that uses the plugin and documents Android/iOS setup for the example project.
+See [example/README.md](example/README.md) — a production-quality Material 3 demo with configurable tracking policies, batching controls, WebSocket subscriber, and full event log.
 
 ---
 

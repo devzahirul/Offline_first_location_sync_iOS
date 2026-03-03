@@ -5,7 +5,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
 
-class SqliteLocationStore(private val dbPath: String) : LocationStore {
+class SqliteLocationStore(private val dbPath: String) : LocationStore, SentPointsPrunableLocationStore {
 
     private fun openDb(): SQLiteDatabase {
         val dbFile = File(dbPath)
@@ -132,6 +132,18 @@ class SqliteLocationStore(private val dbPath: String) : LocationStore {
             pointIds.forEach { id ->
                 db.execSQL("UPDATE location_points SET failed_at = ?, error_message = ? WHERE id = ?", arrayOf(now, errorMessage, id))
             }
+        } finally {
+            db.close()
+        }
+    }
+
+    override suspend fun pruneSentPoints(olderThanRecordedMs: Long) = withContext(Dispatchers.IO) {
+        val db = openDb()
+        try {
+            db.execSQL(
+                "DELETE FROM location_points WHERE sent_at IS NOT NULL AND recorded_at < ?",
+                arrayOf(olderThanRecordedMs)
+            )
         } finally {
             db.close()
         }

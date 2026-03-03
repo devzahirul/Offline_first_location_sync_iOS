@@ -1,0 +1,103 @@
+# Resolve react_native_pods.rb with node to allow for hoisting
+require Pod::Executable.execute_command('node', ['-p',
+  'require.resolve(
+    "react-native/scripts/react_native_pods.rb",
+    {paths: [process.argv[1]]},
+  )', __dir__]).strip
+
+platform :ios, min_ios_version_supported
+prepare_react_native_project!
+
+linkage = ENV['USE_FRAMEWORKS']
+if linkage != nil
+  Pod::UI.puts "Configuring Pod with #{linkage}ally linked Frameworks".green
+  use_frameworks! :linkage => linkage.to_sym
+end
+
+target 'RTLSMobileExample' do
+  config = use_native_modules!
+
+  use_react_native!(
+    :path => config[:reactNativePath],
+    # An absolute path to your application root.
+    :app_path => "#{Pod::Config.instance.installation_root}/.."
+  )
+
+  target 'RTLSMobileExampleTests' do
+    inherit! :complete
+    # Pods for testing
+  end
+
+  post_install do |installer|
+    # https://github.com/facebook/react-native/blob/main/packages/react-native/scripts/react_native_pods.rb#L197-L202
+    react_native_post_install(
+      installer,
+      config[:reactNativePath],
+      :mac_catalyst_enabled => false,
+      # :ccache_enabled => true
+    )
+    # Add RTLSyncKit Swift package to Pods project so rtls-react-native target can import it
+    rtls_add_swift_package_to_pods(installer)
+  end
+end
+
+def rtls_add_swift_package_to_pods(installer)
+  pods_project_path = installer.sandbox.root
+  pbxproj_path = File.join(pods_project_path, 'Pods.xcodeproj', 'project.pbxproj')
+  unless File.exist?(pbxproj_path)
+    Pod::UI.puts "RTLS: Skipping - #{pbxproj_path} not found.".yellow
+    return
+  end
+
+  # From ios/Pods, repo root (with Package.swift) is ../../..
+  rtls_relative_path = '../../..'
+  pkg_ref_id = 'RTLSPKGREF001'
+  pkg_dep_id = 'RTLSPKGDEP001'
+
+  pbx = File.read(pbxproj_path)
+
+  # Skip if already added
+  return if pbx.include?(pkg_ref_id)
+
+  # Add package reference to PBXProject (mainGroup line - insert packageReferences before it)
+  unless pbx.include?('packageReferences = ')
+    pbx.sub!(/(\s+mainGroup = 46EB2E00000010;)/, "\n\t\t\tpackageReferences = (\n\t\t\t\t#{pkg_ref_id} /* RTLSyncKit */,\n\t\t\t);\n\\1")
+  end
+
+  # Add packageProductDependencies to rtls-react-native target (unique productReference)
+  rtls_target_marker = 'productReference = 7FFED08BA39235438EF16F9A8743B06E /* rtls-react-native */;'
+  unless pbx.include?('packageProductDependencies = (')
+    pbx.sub!(
+      /(#{Regexp.escape(rtls_target_marker)}\s+productType = "com.apple.product-type.library.static";)/,
+      "\\1\n\t\t\tpackageProductDependencies = (\n\t\t\t\t#{pkg_dep_id} /* RTLSyncKit */,\n\t\t\t);"
+    )
+  end
+
+  # Append new sections before rootObject
+  swift_pkg_section = <<~SECTION
+    \t/* Begin XCLocalSwiftPackageReference section */
+    \t\t#{pkg_ref_id} /* RTLSyncKit */ = {
+    \t\t\tisa = XCLocalSwiftPackageReference;
+    \t\t\trelativePath = #{rtls_relative_path};
+    \t\t};
+    \t/* End XCLocalSwiftPackageReference section */
+
+    \t/* Begin XCSwiftPackageProductDependency section */
+    \t\t#{pkg_dep_id} /* RTLSyncKit */ = {
+    \t\t\tisa = XCSwiftPackageProductDependency;
+    \t\t\tpackage = #{pkg_ref_id} /* RTLSyncKit */;
+    \t\t\tproductName = RTLSyncKit;
+    \t\t};
+    \t/* End XCSwiftPackageProductDependency section */
+  SECTION
+  unless pbx.include?('XCLocalSwiftPackageReference section')
+    pbx.sub!(/(\t\};\s+rootObject = )/m, "#{swift_pkg_section}\\1")
+  end
+
+  File.write(pbxproj_path, pbx)
+  if File.read(pbxproj_path).include?(pkg_ref_id)
+    Pod::UI.puts "RTLS: Added RTLSyncKit Swift package to Pods project for rtls-react-native.".green
+  else
+    Pod::UI.puts "RTLS: WARNING - modifications may have been overwritten.".yellow
+  end
+end

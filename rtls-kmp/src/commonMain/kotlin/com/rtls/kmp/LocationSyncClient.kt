@@ -79,6 +79,6 @@ class LocationSyncClient(
     }
 
     suspend fun flushNow() {
-        syncEngine.flush()
+        syncEngine.flushNow()
     }
 }

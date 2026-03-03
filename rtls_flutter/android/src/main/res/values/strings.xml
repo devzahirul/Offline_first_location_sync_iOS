@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="rtls_notification_channel_name">Location tracking</string>
+    <string name="rtls_notification_title">Location tracking</string>
+    <string name="rtls_notification_text">Recording location in background</string>
+</resources>

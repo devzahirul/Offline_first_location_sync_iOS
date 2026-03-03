@@ -12,6 +12,18 @@ export interface RTLSConfigureConfig {
   userId: string;
   deviceId: string;
   accessToken: string;
+  /** Max points per batch (default 50). */
+  batchMaxSize?: number;
+  /** Flush interval in seconds (default 10). */
+  flushIntervalSeconds?: number;
+  /** Max age of oldest pending point before flush, in seconds (default 60). */
+  maxBatchAgeSeconds?: number;
+  /** Time-based interval in seconds. Mutually exclusive with locationDistanceMeters. */
+  locationIntervalSeconds?: number;
+  /** Distance-based filter in meters. Mutually exclusive with locationIntervalSeconds. */
+  locationDistanceMeters?: number;
+  /** Use significant location changes (~500m). Overrides interval/distance. */
+  useSignificantLocationOnly?: boolean;
 }
 
 export interface RTLSStats {

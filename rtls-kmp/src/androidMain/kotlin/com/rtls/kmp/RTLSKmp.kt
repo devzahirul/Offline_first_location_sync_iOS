@@ -15,19 +15,36 @@ object RTLSKmp {
         userId: String,
         deviceId: String,
         accessToken: String,
-        scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+        scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate),
+        batchingPolicy: BatchingPolicy = BatchingPolicy(),
+        retryPolicy: SyncRetryPolicy = SyncRetryPolicy.Default,
+        retentionPolicy: RetentionPolicy = RetentionPolicy.Recommended,
+        networkMonitor: NetworkMonitor? = AndroidNetworkMonitor(context)
     ): LocationSyncClient {
         val dbDir = File(context.filesDir, "rtls_kmp").apply { mkdirs() }
         val dbPath = File(dbDir, "rtlsync.db").absolutePath
         val store = SqliteLocationStore(dbPath)
         val tokenProvider = AuthTokenProvider { accessToken }
         val api = OkHttpLocationSyncAPI(baseUrl.trimEnd('/'), tokenProvider)
-        val syncEngine = SyncEngine(store, api, batchSize = 50, scope)
+        val syncEngine = SyncEngine(
+            store = store,
+            api = api,
+            batching = batchingPolicy,
+            retryPolicy = retryPolicy,
+            retentionPolicy = retentionPolicy,
+            networkMonitor = networkMonitor,
+            scope = scope
+        )
         return LocationSyncClient(store, syncEngine, userId, deviceId, scope)
     }
 
-    fun createLocationFlow(context: Context, userId: String, deviceId: String): Flow<LocationPoint> {
+    fun createLocationFlow(
+        context: Context,
+        userId: String,
+        deviceId: String,
+        params: LocationRequestParams = LocationRequestParams()
+    ): Flow<LocationPoint> {
         val provider = AndroidLocationProvider(context)
-        return provider.locationFlow(userId, deviceId)
+        return provider.locationFlow(userId, deviceId, params)
     }
 }
