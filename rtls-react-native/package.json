@@ -1,0 +1,13 @@
+{
+  "name": "rtls-react-native",
+  "version": "0.1.0",
+  "description": "React Native native module for offline-first location sync (iOS, uses RTLSyncKit)",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "scripts": {},
+  "peerDependencies": {
+    "react-native": "*"
+  },
+  "repository": {},
+  "license": "MIT"
+}
