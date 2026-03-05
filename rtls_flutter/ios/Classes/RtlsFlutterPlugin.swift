@@ -7,6 +7,7 @@ public class RtlsFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
     private var client: LocationSyncClient?
     private var eventSink: FlutterEventSink?
     private var eventTask: Task<Void, Never>?
+    private var lifecycleRegistered = false
 
     public static func register(with registrar: FlutterPluginRegistrar) {
         let channel = FlutterMethodChannel(name: "com.rtls.flutter/rtls", binaryMessenger: registrar.messenger())
@@ -14,6 +15,24 @@ public class RtlsFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
         registrar.addMethodCallDelegate(instance, channel: channel)
         let eventChannel = FlutterEventChannel(name: "com.rtls.flutter/rtls_events", binaryMessenger: registrar.messenger())
         eventChannel.setStreamHandler(instance)
+    }
+
+    private func registerLifecycleObserversIfNeeded() {
+        guard !lifecycleRegistered else { return }
+        lifecycleRegistered = true
+        let center = NotificationCenter.default
+        center.addObserver(self, selector: #selector(appWillEnterForeground), name: UIApplication.willEnterForegroundNotification, object: nil)
+        center.addObserver(self, selector: #selector(appDidEnterBackground), name: UIApplication.didEnterBackgroundNotification, object: nil)
+    }
+
+    @objc private func appWillEnterForeground() {
+        guard let client = client else { return }
+        Task { await client.flushNow() }
+    }
+
+    @objc private func appDidEnterBackground() {
+        guard let client = client else { return }
+        Task { await client.flushNow(maxBatches: 2) }
     }
 
     public func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
@@ -63,9 +82,12 @@ public class RtlsFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
 
             var locationConfig = LocationProvider.Configuration()
             locationConfig.allowsBackgroundLocationUpdates = true
-            locationConfig.pausesLocationUpdatesAutomatically = false
+            locationConfig.pausesLocationUpdatesAutomatically = !significantOnly
             locationConfig.showsBackgroundLocationIndicator = true
             locationConfig.useSignificantLocationChanges = significantOnly
+            if significantOnly {
+                locationConfig.desiredAccuracy = kCLLocationAccuracyHundredMeters
+            }
             switch trackingPolicy {
             case .time:
                 locationConfig.distanceFilter = kCLDistanceFilterNone
@@ -91,6 +113,7 @@ public class RtlsFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
                     let c = try await LocationSyncClient(configuration: config)
                     await MainActor.run {
                         self.client = c
+                        self.registerLifecycleObserversIfNeeded()
                         self.startEventLoop(client: c)
                         result(nil)
                     }

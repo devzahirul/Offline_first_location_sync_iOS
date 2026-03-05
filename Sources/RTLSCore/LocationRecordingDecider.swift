@@ -2,20 +2,28 @@ import Foundation
 
 public struct LocationRecordingDecider: Sendable, Equatable {
     public var policy: TrackingPolicy
+    /// Reject samples with horizontal accuracy worse than this (meters). 0 = no filter.
+    public var maxAcceptableAccuracy: Double
     public private(set) var lastRecordedAt: Date?
     public private(set) var lastRecordedCoordinate: GeoCoordinate?
 
     public init(
         policy: TrackingPolicy,
+        maxAcceptableAccuracy: Double = 100,
         lastRecordedAt: Date? = nil,
         lastRecordedCoordinate: GeoCoordinate? = nil
     ) {
         self.policy = policy
+        self.maxAcceptableAccuracy = maxAcceptableAccuracy
         self.lastRecordedAt = lastRecordedAt
         self.lastRecordedCoordinate = lastRecordedCoordinate
     }
 
-    public func shouldRecord(sampleAt: Date, coordinate: GeoCoordinate) -> Bool {
+    public func shouldRecord(sampleAt: Date, coordinate: GeoCoordinate, horizontalAccuracy: Double? = nil) -> Bool {
+        if maxAcceptableAccuracy > 0, let acc = horizontalAccuracy, acc > maxAcceptableAccuracy {
+            return false
+        }
+
         switch policy {
         case .time(let interval):
             guard interval > 0 else { return true }

@@ -1,9 +1,12 @@
 package com.rtls.rtls_flutter
 
 import android.Manifest
+import android.app.Activity
+import android.app.Application
 import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
+import android.os.Bundle
 import androidx.core.content.ContextCompat
 import io.flutter.embedding.engine.plugins.FlutterPlugin
 import io.flutter.embedding.engine.plugins.activity.ActivityAware
@@ -20,6 +23,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import com.rtls.kmp.BatchingPolicy
+import com.rtls.kmp.LocationRecordingDecider
 import com.rtls.kmp.LocationRequestParams
 import com.rtls.kmp.LocationSyncClientEvent
 import com.rtls.kmp.RTLSKmp
@@ -38,9 +42,36 @@ class RtlsFlutterPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventC
     private var locationRequestParams: LocationRequestParams = LocationRequestParams()
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private var eventCollectionJob: Job? = null
+    private var lifecycleCallbacks: Application.ActivityLifecycleCallbacks? = null
 
     companion object {
         private const val REQUEST_CODE_LOCATION = 0x2a02
+    }
+
+    private fun registerLifecycleCallbacksIfNeeded() {
+        if (lifecycleCallbacks != null) return
+        val app = (context as? Application) ?: return
+        val callbacks = object : Application.ActivityLifecycleCallbacks {
+            override fun onActivityResumed(activity: Activity) {
+                scope.launch { client?.flushNow() }
+            }
+            override fun onActivityPaused(activity: Activity) {
+                scope.launch { client?.flushNow() }
+            }
+            override fun onActivityCreated(a: Activity, b: Bundle?) {}
+            override fun onActivityStarted(a: Activity) {}
+            override fun onActivityStopped(a: Activity) {}
+            override fun onActivitySaveInstanceState(a: Activity, b: Bundle) {}
+            override fun onActivityDestroyed(a: Activity) {}
+        }
+        lifecycleCallbacks = callbacks
+        app.registerActivityLifecycleCallbacks(callbacks)
+    }
+
+    private fun unregisterLifecycleCallbacks() {
+        val app = (context as? Application) ?: return
+        lifecycleCallbacks?.let { app.unregisterActivityLifecycleCallbacks(it) }
+        lifecycleCallbacks = null
     }
 
     override fun onAttachedToEngine(binding: FlutterPlugin.FlutterPluginBinding) {
@@ -56,6 +87,7 @@ class RtlsFlutterPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventC
         channel = null
         eventChannel?.setStreamHandler(null)
         eventChannel = null
+        unregisterLifecycleCallbacks()
         client?.stopTracking()
         client = null
         context?.let { RtlsLocationForegroundService.stop(it) }
@@ -139,26 +171,55 @@ class RtlsFlutterPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventC
                 client?.stopTracking()
                 lastUserId = userId
                 lastDeviceId = deviceId
+                val maxAccuracy = call.argument<Number>("maxAcceptableAccuracyMeters")?.toFloat() ?: 100f
                 locationRequestParams = when {
                     significantOnly -> LocationRequestParams(
                         intervalMillis = 60_000L,
                         minUpdateIntervalMillis = 60_000L,
-                        minUpdateDistanceMeters = 500f
+                        minUpdateDistanceMeters = 500f,
+                        maxUpdateDelayMillis = 120_000L,
+                        useBalancedPowerAccuracy = true,
+                        maxAcceptableAccuracyMeters = maxAccuracy
                     )
                     intervalSec != null && intervalSec > 0 -> {
                         val ms = (intervalSec * 1000).toLong().coerceAtLeast(5_000L)
                         LocationRequestParams(
                             intervalMillis = ms,
                             minUpdateIntervalMillis = ms,
-                            minUpdateDistanceMeters = 0f
+                            minUpdateDistanceMeters = 0f,
+                            maxUpdateDelayMillis = (ms * 3).coerceAtMost(60_000L),
+                            maxAcceptableAccuracyMeters = maxAccuracy
                         )
                     }
                     distanceM != null && distanceM > 0 -> LocationRequestParams(
                         intervalMillis = 10_000L,
                         minUpdateIntervalMillis = 5_000L,
-                        minUpdateDistanceMeters = distanceM.toFloat().coerceAtLeast(1f)
+                        minUpdateDistanceMeters = distanceM.toFloat().coerceAtLeast(1f),
+                        maxUpdateDelayMillis = 30_000L,
+                        maxAcceptableAccuracyMeters = maxAccuracy
                     )
-                    else -> LocationRequestParams()
+                    else -> LocationRequestParams(
+                        maxUpdateDelayMillis = 30_000L,
+                        maxAcceptableAccuracyMeters = maxAccuracy
+                    )
+                }
+                val decider = when {
+                    significantOnly -> LocationRecordingDecider(
+                        minDistanceMeters = 500.0,
+                        maxAcceptableAccuracy = maxAccuracy.toDouble()
+                    )
+                    distanceM != null && distanceM > 0 -> LocationRecordingDecider(
+                        minDistanceMeters = distanceM,
+                        maxAcceptableAccuracy = maxAccuracy.toDouble()
+                    )
+                    intervalSec != null && intervalSec > 0 -> LocationRecordingDecider(
+                        minTimeIntervalMs = (intervalSec * 1000).toLong(),
+                        maxAcceptableAccuracy = maxAccuracy.toDouble()
+                    )
+                    else -> LocationRecordingDecider(
+                        minDistanceMeters = 25.0,
+                        maxAcceptableAccuracy = maxAccuracy.toDouble()
+                    )
                 }
                 client = RTLSKmp.createLocationSyncClient(
                     context = ctx,
@@ -167,8 +228,10 @@ class RtlsFlutterPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventC
                     deviceId = deviceId,
                     accessToken = accessToken,
                     scope = scope,
-                    batchingPolicy = batchingPolicy
+                    batchingPolicy = batchingPolicy,
+                    recordingDecider = decider
                 )
+                registerLifecycleCallbacksIfNeeded()
                 startEventCollectionIfReady()
                 result.success(null)
             }

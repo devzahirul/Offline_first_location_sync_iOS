@@ -24,12 +24,14 @@ public actor SyncEngine {
     private var timerTask: Task<Void, Never>?
     private var networkTask: Task<Void, Never>?
     private var pullTask: Task<Void, Never>?
+    private var notifyDebounceTask: Task<Void, Never>?
     private var flushing = false
 
     private var failureCount = 0
     private var nextAllowedFlushAt: Date?
     private var lastPruneAt: Date?
     private var lastPullAt: Date?
+    private var pendingInsertsSinceLastFlush = 0
 
     private let eventsStream: AsyncStream<SyncEngineEvent>
     private let continuation: AsyncStream<SyncEngineEvent>.Continuation
@@ -111,7 +113,16 @@ public actor SyncEngine {
     }
 
     public func notifyNewData() {
-        Task { await flushIfNeeded(force: false) }
+        pendingInsertsSinceLastFlush += 1
+        if pendingInsertsSinceLastFlush >= batching.maxBatchSize {
+            Task { await flushIfNeeded(force: false) }
+            return
+        }
+        notifyDebounceTask?.cancel()
+        notifyDebounceTask = Task {
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            await flushIfNeeded(force: false)
+        }
     }
 
     public func flushNow(maxBatches: Int? = nil) async {
@@ -170,6 +181,7 @@ public actor SyncEngine {
                     )
                 }
 
+                pendingInsertsSinceLastFlush = 0
                 continuation.yield(.didUpload(accepted: result.acceptedIds.count, rejected: result.rejected.count))
                 batchesProcessed += 1
 
@@ -190,11 +202,11 @@ public actor SyncEngine {
     private func shouldFlush(force: Bool) async throws -> Bool {
         if force { return true }
 
-        let count = try await store.pendingCount()
-        if count == 0 { return false }
-        if count >= batching.maxBatchSize { return true }
+        let stats = try await store.pendingStats()
+        if stats.count == 0 { return false }
+        if stats.count >= batching.maxBatchSize { return true }
 
-        if let oldest = try await store.oldestPendingRecordedAt() {
+        if let oldest = stats.oldestRecordedAt {
             let age = Date().timeIntervalSince(oldest)
             if age >= batching.maxBatchAge { return true }
         }

@@ -46,12 +46,14 @@ class SyncEngine(
     private var timerJob: Job? = null
     private var networkJob: Job? = null
     private var pullJob: Job? = null
+    private var notifyDebounceJob: Job? = null
     private var running = false
     private val flushMutex = Mutex()
     private var failureCount = 0
     private var nextAllowedFlushAtMs: Long? = null
     private var lastPruneAtMs: Long? = null
     private var lastPullAtMs: Long? = null
+    private var pendingInsertsSinceLastFlush = 0
 
     fun start() {
         if (running) return
@@ -97,7 +99,16 @@ class SyncEngine(
     }
 
     fun notifyNewData() {
-        scope.launch { flushIfNeeded(force = false, maxBatches = null) }
+        pendingInsertsSinceLastFlush++
+        if (pendingInsertsSinceLastFlush >= batching.maxBatchSize) {
+            scope.launch { flushIfNeeded(force = false, maxBatches = null) }
+            return
+        }
+        notifyDebounceJob?.cancel()
+        notifyDebounceJob = scope.launch {
+            delay(2_000L)
+            flushIfNeeded(force = false, maxBatches = null)
+        }
     }
 
     suspend fun flushNow(maxBatches: Int? = null) {
@@ -186,6 +197,7 @@ class SyncEngine(
                         )
                     }
 
+                    pendingInsertsSinceLastFlush = 0
                     _events.emit(SyncEngineEvent.UploadSuccess(result.acceptedIds.size, result.rejected.size))
                     batchesProcessed++
                     maybePruneSentPoints(sentAt)
@@ -204,10 +216,10 @@ class SyncEngine(
 
     private suspend fun shouldFlush(force: Boolean): Boolean {
         if (force) return true
-        val count = store.pendingCount()
-        if (count == 0) return false
-        if (count >= batching.maxBatchSize) return true
-        val oldest = store.oldestPendingRecordedAt() ?: return false
+        val stats = store.pendingStats()
+        if (stats.count == 0) return false
+        if (stats.count >= batching.maxBatchSize) return true
+        val oldest = stats.oldestRecordedAtMs ?: return false
         val ageSeconds = (System.currentTimeMillis() - oldest) / 1000
         return ageSeconds >= batching.maxBatchAgeSeconds
     }

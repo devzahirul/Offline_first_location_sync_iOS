@@ -246,7 +246,7 @@ public actor LocationSyncClient {
 
         case .didUpdate(let sample):
             guard isTracking else { return }
-            guard recordingDecider.shouldRecord(sampleAt: sample.recordedAt, coordinate: sample.coordinate) else { return }
+            guard recordingDecider.shouldRecord(sampleAt: sample.recordedAt, coordinate: sample.coordinate, horizontalAccuracy: sample.horizontalAccuracy) else { return }
 
             let point = LocationPoint(
                 userId: config.userId,

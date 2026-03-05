@@ -253,6 +253,18 @@ public actor SQLiteLocationStore: LocationStore, SentPointsPrunableLocationStore
         return Self.msToDate(columnInt64(stmt, index: 0))
     }
 
+    public func pendingStats() async throws -> PendingStats {
+        let sql = "SELECT COUNT(1), MIN(recorded_at_ms) FROM location_points WHERE sync_status = ?;"
+        let stmt = try db.prepare(sql)
+        defer { sqlite3_finalize(stmt) }
+
+        try bindInt(stmt, index: 1, value: SyncStatus.pending.rawValue)
+        guard sqlite3_step(stmt) == SQLITE_ROW else { return PendingStats(count: 0, oldestRecordedAt: nil) }
+        let count = Int(sqlite3_column_int(stmt, 0))
+        let oldest: Date? = (sqlite3_column_type(stmt, 1) == SQLITE_NULL) ? nil : Self.msToDate(columnInt64(stmt, index: 1))
+        return PendingStats(count: count, oldestRecordedAt: oldest)
+    }
+
     public func markSent(pointIds: [UUID], sentAt: Date) async throws {
         try mark(pointIds: pointIds, status: .sent, sentAt: sentAt, errorMessage: nil)
     }
@@ -403,35 +415,28 @@ public actor SQLiteLocationStore: LocationStore, SentPointsPrunableLocationStore
     private func mark(pointIds: [UUID], status: SyncStatus, sentAt: Date?, errorMessage: String?) throws {
         guard !pointIds.isEmpty else { return }
 
-        try db.exec("BEGIN TRANSACTION;")
-        do {
+        let sentAtMs = sentAt.map(Self.dateToMs)
+        let chunkSize = 999
+        for chunk in stride(from: 0, to: pointIds.count, by: chunkSize).map({ Array(pointIds[$0..<min($0 + chunkSize, pointIds.count)]) }) {
+            let placeholders = chunk.map { _ in "?" }.joined(separator: ",")
             let sql = """
             UPDATE location_points
             SET sync_status = ?, last_error = ?, sent_at_ms = ?
-            WHERE id = ?;
+            WHERE id IN (\(placeholders));
             """
             let stmt = try db.prepare(sql)
             defer { sqlite3_finalize(stmt) }
 
-            let sentAtMs = sentAt.map(Self.dateToMs)
-            for id in pointIds {
-                sqlite3_reset(stmt)
-                sqlite3_clear_bindings(stmt)
-
-                try bindInt(stmt, index: 1, value: status.rawValue)
-                try bindNullableText(stmt, index: 2, value: errorMessage)
-                try bindNullableInt64(stmt, index: 3, value: sentAtMs)
-                try bindText(stmt, index: 4, value: id.uuidString)
-
-                guard sqlite3_step(stmt) == SQLITE_DONE else {
-                    throw SQLiteError.step(db.lastErrorMessage())
-                }
+            try bindInt(stmt, index: 1, value: status.rawValue)
+            try bindNullableText(stmt, index: 2, value: errorMessage)
+            try bindNullableInt64(stmt, index: 3, value: sentAtMs)
+            for (offset, id) in chunk.enumerated() {
+                try bindText(stmt, index: Int32(4 + offset), value: id.uuidString)
             }
 
-            try db.exec("COMMIT;")
-        } catch {
-            try? db.exec("ROLLBACK;")
-            throw error
+            guard sqlite3_step(stmt) == SQLITE_DONE else {
+                throw SQLiteError.step(db.lastErrorMessage())
+            }
         }
     }
 

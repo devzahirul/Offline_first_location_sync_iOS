@@ -85,17 +85,27 @@ class SqliteLocationStore(private val context: Context) : LocationStore, SentPoi
         result
     }
 
+    override suspend fun pendingStats(): PendingStats = withContext(Dispatchers.IO) {
+        val db = helper.readableDatabase
+        val c = db.rawQuery(
+            "SELECT COUNT(*), MIN(recorded_at) FROM location_points WHERE $pendingWhere", null
+        )
+        val stats = if (c.moveToFirst()) {
+            PendingStats(c.getInt(0), if (c.isNull(1)) null else c.getLong(1))
+        } else {
+            PendingStats(0, null)
+        }
+        c.close()
+        stats
+    }
+
     override suspend fun markSent(pointIds: List<String>, sentAtMs: Long) = withContext(Dispatchers.IO) {
         if (pointIds.isEmpty()) return@withContext
         val db = helper.writableDatabase
-        db.beginTransaction()
-        try {
-            pointIds.forEach { id ->
-                db.execSQL("UPDATE location_points SET sent_at = ? WHERE id = ?", arrayOf(sentAtMs, id))
-            }
-            db.setTransactionSuccessful()
-        } finally {
-            db.endTransaction()
+        for (chunk in pointIds.chunked(999)) {
+            val placeholders = chunk.joinToString(",") { "?" }
+            val args = arrayOf(sentAtMs.toString()) + chunk.toTypedArray()
+            db.execSQL("UPDATE location_points SET sent_at = ? WHERE id IN ($placeholders)", args)
         }
     }
 
@@ -103,14 +113,10 @@ class SqliteLocationStore(private val context: Context) : LocationStore, SentPoi
         if (pointIds.isEmpty()) return@withContext
         val now = System.currentTimeMillis()
         val db = helper.writableDatabase
-        db.beginTransaction()
-        try {
-            pointIds.forEach { id ->
-                db.execSQL("UPDATE location_points SET failed_at = ?, error_message = ? WHERE id = ?", arrayOf(now, errorMessage, id))
-            }
-            db.setTransactionSuccessful()
-        } finally {
-            db.endTransaction()
+        for (chunk in pointIds.chunked(999)) {
+            val placeholders = chunk.joinToString(",") { "?" }
+            val args = arrayOf(now.toString(), errorMessage) + chunk.toTypedArray()
+            db.execSQL("UPDATE location_points SET failed_at = ?, error_message = ? WHERE id IN ($placeholders)", args)
         }
     }
 
@@ -235,6 +241,11 @@ class SqliteLocationStore(private val context: Context) : LocationStore, SentPoi
     ) {
         init {
             setWriteAheadLoggingEnabled(true)
+        }
+
+        override fun onConfigure(db: SQLiteDatabase) {
+            super.onConfigure(db)
+            db.execSQL("PRAGMA synchronous = NORMAL")
         }
 
         override fun onCreate(db: SQLiteDatabase) {

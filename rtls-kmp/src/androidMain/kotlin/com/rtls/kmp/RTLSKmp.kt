@@ -18,7 +18,8 @@ object RTLSKmp {
         batchingPolicy: BatchingPolicy = BatchingPolicy(),
         retryPolicy: SyncRetryPolicy = SyncRetryPolicy.Default,
         retentionPolicy: RetentionPolicy = RetentionPolicy.Recommended,
-        networkMonitor: NetworkMonitor? = AndroidNetworkMonitor(context)
+        networkMonitor: NetworkMonitor? = AndroidNetworkMonitor(context),
+        recordingDecider: LocationRecordingDecider? = null
     ): LocationSyncClient {
         val store = SqliteLocationStore(context)
         val tokenProvider = AuthTokenProvider { accessToken }
@@ -32,7 +33,7 @@ object RTLSKmp {
             networkMonitor = networkMonitor,
             scope = scope
         )
-        return LocationSyncClient(store, syncEngine, userId, deviceId, scope)
+        return LocationSyncClient(store, syncEngine, userId, deviceId, scope, recordingDecider)
     }
 
     fun createLocationFlow(

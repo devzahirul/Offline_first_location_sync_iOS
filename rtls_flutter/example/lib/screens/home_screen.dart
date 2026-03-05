@@ -29,7 +29,7 @@ class HomeScreen extends StatefulWidget {
   State<HomeScreen> createState() => _HomeScreenState();
 }
 
-class _HomeScreenState extends State<HomeScreen> {
+class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   final _baseUrlController = TextEditingController(text: AppConstants.defaultBaseUrl);
   final _userIdController = TextEditingController(text: AppConstants.defaultUserId);
   final _deviceIdController = TextEditingController(text: AppConstants.defaultDeviceId);
@@ -78,6 +78,7 @@ class _HomeScreenState extends State<HomeScreen> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _distanceMetersController = TextEditingController(text: _distanceMeters.toString());
     _timeIntervalController = TextEditingController(text: _timeIntervalSeconds.toString());
     _flushIntervalController = TextEditingController(text: _flushIntervalSeconds.toString());
@@ -89,6 +90,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _noLocationTimer?.cancel();
     _eventSub?.cancel();
     _wsSub?.cancel();
@@ -103,6 +105,18 @@ class _HomeScreenState extends State<HomeScreen> {
     _flushIntervalController.dispose();
     _maxBatchAgeController.dispose();
     super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (!_configured) return;
+    if (state == AppLifecycleState.resumed) {
+      _log('Foreground: flushing pending points');
+      RTLSync.flushNow().then((_) => _loadStats()).catchError((_) {});
+    } else if (state == AppLifecycleState.paused) {
+      _log('Background: flushing pending points');
+      RTLSync.flushNow().catchError((_) {});
+    }
   }
 
   void _subscriberStart() {

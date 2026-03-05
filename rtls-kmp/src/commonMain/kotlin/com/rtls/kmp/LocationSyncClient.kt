@@ -27,7 +27,8 @@ class LocationSyncClient(
     private val syncEngine: SyncEngine,
     private val userId: String,
     private val deviceId: String,
-    private val scope: CoroutineScope
+    private val scope: CoroutineScope,
+    private val recordingDecider: LocationRecordingDecider? = null
 ) {
     private val _events = MutableSharedFlow<LocationSyncClientEvent>(extraBufferCapacity = 256)
     val events: SharedFlow<LocationSyncClientEvent> = _events.asSharedFlow()
@@ -45,8 +46,10 @@ class LocationSyncClient(
             locationFlow
                 .catch { e -> _events.emit(LocationSyncClientEvent.Error(e.message ?: "Location error")) }
                 .collect { point ->
+                    if (recordingDecider != null && !recordingDecider.shouldRecord(point)) return@collect
                     try {
                         store.insert(listOf(point))
+                        recordingDecider?.markRecorded(point)
                         _events.emit(LocationSyncClientEvent.Recorded(point))
                         syncEngine.notifyNewData()
                     } catch (e: Exception) {

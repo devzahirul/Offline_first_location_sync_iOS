@@ -23,7 +23,16 @@ import java.util.UUID
 data class LocationRequestParams(
     val intervalMillis: Long = 10_000L,
     val minUpdateIntervalMillis: Long = 10_000L,
-    val minUpdateDistanceMeters: Float = 10f
+    val minUpdateDistanceMeters: Float = 10f,
+    /** Hardware-level batching: buffer updates for up to this long before waking the CPU.
+     *  0 = deliver immediately (no batching). Higher = less CPU wake-ups = major power saving.
+     *  Recommended: 2-5x intervalMillis (e.g. 30_000-60_000 for 10s interval). */
+    val maxUpdateDelayMillis: Long = 0L,
+    /** Use balanced power accuracy (WiFi/cell) instead of high accuracy (GPS).
+     *  Sufficient for most sync use cases; saves significant battery. */
+    val useBalancedPowerAccuracy: Boolean = false,
+    /** Reject locations with horizontal accuracy worse than this (meters). 0 = no filter. */
+    val maxAcceptableAccuracyMeters: Float = 0f
 )
 
 class AndroidLocationProvider(private val context: Context) {
@@ -76,19 +85,33 @@ class AndroidLocationProvider(private val context: Context) {
         }
         last?.let { trySend(it.toLocationPoint(userId, deviceId)) }
 
-        val request = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, params.intervalMillis)
+        val priority = if (params.useBalancedPowerAccuracy)
+            Priority.PRIORITY_BALANCED_POWER_ACCURACY else Priority.PRIORITY_HIGH_ACCURACY
+        val request = LocationRequest.Builder(priority, params.intervalMillis)
             .setMinUpdateIntervalMillis(params.minUpdateIntervalMillis)
             .setMinUpdateDistanceMeters(params.minUpdateDistanceMeters)
-            .setMaxUpdates(Int.MAX_VALUE)
+            .apply {
+                if (params.maxUpdateDelayMillis > 0) {
+                    setMaxUpdateDelayMillis(params.maxUpdateDelayMillis)
+                }
+            }
             .build()
 
+        val maxAcc = params.maxAcceptableAccuracyMeters
         val callback = object : LocationCallback() {
             override fun onLocationResult(result: com.google.android.gms.location.LocationResult) {
                 val locations = result.locations
                 if (!locations.isNullOrEmpty()) {
-                    locations.forEach { loc -> trySend(loc.toLocationPoint(userId, deviceId)) }
+                    for (loc in locations) {
+                        if (maxAcc > 0f && loc.hasAccuracy() && loc.accuracy > maxAcc) continue
+                        trySend(loc.toLocationPoint(userId, deviceId))
+                    }
                 } else {
-                    result.lastLocation?.let { loc -> trySend(loc.toLocationPoint(userId, deviceId)) }
+                    result.lastLocation?.let { loc ->
+                        if (maxAcc <= 0f || !loc.hasAccuracy() || loc.accuracy <= maxAcc) {
+                            trySend(loc.toLocationPoint(userId, deviceId))
+                        }
+                    }
                 }
             }
         }
