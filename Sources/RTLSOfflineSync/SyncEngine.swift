@@ -26,12 +26,12 @@ public actor SyncEngine {
     private var pullTask: Task<Void, Never>?
     private var notifyDebounceTask: Task<Void, Never>?
     private var flushing = false
+    private var flushInProgress = false  // Reentrancy guard for flush operations
     private var hasPendingData = false
     private var cachedConnectionType: ConnectionType = .unknown
 
     private var failureCount = 0
     private var nextAllowedFlushAt: Date?
-    private var lastPruneAt: Date?
     private var lastPullAt: Date?
     private var pendingInsertsSinceLastFlush = 0
 
@@ -180,6 +180,7 @@ public actor SyncEngine {
 
     private func flushIfNeeded(force: Bool, maxBatches: Int? = nil) async {
         guard !flushing else { return }
+        guard !flushInProgress else { return }  // Prevent reentrant flush
         guard !Task.isCancelled else { return }
 
         if !force, let nextAllowedFlushAt, Date() < nextAllowedFlushAt {
@@ -196,7 +197,11 @@ public actor SyncEngine {
         }
 
         flushing = true
-        defer { flushing = false }
+        flushInProgress = true
+        defer {
+            flushing = false
+            flushInProgress = false
+        }
 
         var batchesProcessed = 0
         while await network.isOnline() {
@@ -218,7 +223,13 @@ public actor SyncEngine {
                 nextAllowedFlushAt = nil
 
                 if !result.acceptedIds.isEmpty {
-                    try await store.markSent(pointIds: result.acceptedIds, sentAt: now)
+                    // Use atomic operation to prevent data loss on crash
+                    if let prunable = store as? (any SentPointsPrunableLocationStore) {
+                        let cutoff = retentionPolicy.sentPointsMaxAge.map { now.addingTimeInterval(-$0) }
+                        try await prunable.markSentAndPrune(pointIds: result.acceptedIds, sentAt: now, olderThanRecordedAt: cutoff)
+                    } else {
+                        try await store.markSent(pointIds: result.acceptedIds, sentAt: now)
+                    }
                 }
 
                 if !result.rejected.isEmpty {
@@ -231,8 +242,6 @@ public actor SyncEngine {
                 pendingInsertsSinceLastFlush = 0
                 continuation.yield(.didUpload(accepted: result.acceptedIds.count, rejected: result.rejected.count))
                 batchesProcessed += 1
-
-                await maybePruneSentPoints(now: now)
 
                 if result.acceptedIds.isEmpty, result.rejected.isEmpty {
                     break
@@ -303,29 +312,5 @@ public actor SyncEngine {
         } catch {
             continuation.yield(.pullFailed(String(describing: error)))
         }
-    }
-
-    private func maybePruneSentPoints(now: Date) async {
-        guard let maxAge = retentionPolicy.sentPointsMaxAge else { return }
-        guard maxAge > 0 else { return }
-
-        let minInterval: TimeInterval = 60 * 60
-        if let lastPruneAt, now.timeIntervalSince(lastPruneAt) < minInterval {
-            return
-        }
-
-        guard let prunable = store as? any SentPointsPrunableLocationStore else {
-            lastPruneAt = now
-            return
-        }
-
-        do {
-            let cutoff = now.addingTimeInterval(-maxAge)
-            try await prunable.pruneSentPoints(olderThan: cutoff)
-        } catch {
-            // Non-fatal: retention cleanup shouldn't block sync.
-        }
-
-        lastPruneAt = now
     }
 }

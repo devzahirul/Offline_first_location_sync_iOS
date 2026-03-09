@@ -3,6 +3,7 @@ import { createGunzip } from "node:zlib";
 import os from "node:os";
 import express from "express";
 import type { Request, Response, NextFunction } from "express";
+import rateLimit from "express-rate-limit";
 
 function getLanIp(): string | null {
   const ifaces = os.networkInterfaces();
@@ -56,6 +57,46 @@ app.use((req: Request, res: Response, next: NextFunction) => {
 const hub = new WsHub();
 const latestByUser = new Map<string, any>();
 const db = await createDB();
+
+// Rate limiting for WebSocket auth attempts
+const authAttempts = new Map<string, { count: number; resetAt: number }>();
+
+function checkAuthRateLimit(ip: string): { allowed: boolean; shouldIncrement: boolean } {
+  const now = Date.now();
+  const attempt = authAttempts.get(ip) || { count: 0, resetAt: now + 60_000 };
+
+  if (now > attempt.resetAt) {
+    // Reset window expired
+    authAttempts.set(ip, { count: 0, resetAt: now + 60_000 });
+    return { allowed: true, shouldIncrement: true };
+  }
+
+  if (attempt.count >= 5) {
+    // Rate limited
+    return { allowed: false, shouldIncrement: false };
+  }
+
+  return { allowed: true, shouldIncrement: true };
+}
+
+function recordAuthAttempt(ip: string, success: boolean) {
+  if (success) {
+    authAttempts.delete(ip);
+    return;
+  }
+
+  const attempt = authAttempts.get(ip) || { count: 0, resetAt: Date.now() + 60_000 };
+  authAttempts.set(ip, { count: attempt.count + 1, resetAt: attempt.resetAt });
+}
+
+// Rate limiter for pull endpoint - prevents DoS via large limit queries
+const pullLimiter = rateLimit({
+  windowMs: 60_000, // 1 minute
+  max: 30, // 30 pull requests per minute per IP
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many pull requests" },
+});
 
 app.get("/", (_req, res) =>
   res.json({
@@ -116,7 +157,7 @@ app.post("/v1/locations/batch", async (req, res) => {
   }
 });
 
-app.get("/v1/locations/pull", async (req, res) => {
+app.get("/v1/locations/pull", pullLimiter, async (req, res) => {
   try {
     requireAuth(req);
     const { userId, cursor, limit } = PullQuerySchema.parse(req.query);
@@ -143,6 +184,17 @@ app.get("/v1/locations/pull", async (req, res) => {
 
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: "/v1/ws" });
+
+// Cleanup on server close
+process.on("SIGTERM", () => {
+  hub.destroy();
+  server.close();
+});
+
+process.on("SIGINT", () => {
+  hub.destroy();
+  server.close();
+});
 
 wss.on("connection", (socket, req) => {
   let authenticated = !process.env.JWT_SECRET;
@@ -177,13 +229,25 @@ wss.on("connection", (socket, req) => {
 
     switch (msg.type) {
       case "auth": {
+        // Check rate limit before attempting auth
+        const ip = req.socket.remoteAddress || "unknown";
+        const rateCheck = checkAuthRateLimit(ip);
+
+        if (!rateCheck.allowed) {
+          sendJson({ type: "error", message: "Too many auth attempts" });
+          socket.close(4000, "rate limited");
+          return;
+        }
+
         if (process.env.JWT_SECRET) {
           try {
             const jwt = await import("jsonwebtoken");
             jwt.default.verify(msg.token, process.env.JWT_SECRET);
             authenticated = true;
+            recordAuthAttempt(ip, true);
             sendJson({ type: "auth.ok" });
           } catch {
+            recordAuthAttempt(ip, false);
             sendJson({ type: "error", message: "Authentication failed" });
             socket.close(1008, "auth failed");
           }

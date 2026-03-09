@@ -1,38 +1,51 @@
 package com.rtls.location
 
 import com.rtls.core.LocationPoint
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlin.math.*
 
+/**
+ * Thread-safe location recording decider with mutex-protected state.
+ * Prevents race conditions when accessed from multiple coroutines.
+ */
 class LocationRecordingDecider(
     private val minTimeIntervalMs: Long = 0L,
     private val minDistanceMeters: Double = 0.0,
     private val maxAcceptableAccuracy: Double = 0.0
 ) {
-    private var lastRecordedAtMs: Long? = null
-    private var lastLat: Double? = null
-    private var lastLng: Double? = null
+    private val stateMutex = Mutex()
+    private var lastRecordedState: RecordedState? = null
 
-    fun shouldRecord(point: LocationPoint): Boolean {
+    private data class RecordedState(
+        val timestampMs: Long,
+        val lat: Double,
+        val lng: Double
+    )
+
+    /**
+     * Thread-safe check if a point should be recorded.
+     */
+    suspend fun shouldRecord(point: LocationPoint): Boolean = stateMutex.withLock {
         if (maxAcceptableAccuracy > 0.0) {
             val acc = point.horizontalAccuracy
-            if (acc != null && acc > maxAcceptableAccuracy) return false
+            if (acc != null && acc > maxAcceptableAccuracy) return@withLock false
         }
-        val prevTime = lastRecordedAtMs
-        val prevLat = lastLat
-        val prevLng = lastLng
-        if (prevTime == null || prevLat == null || prevLng == null) return true
-        if (minTimeIntervalMs > 0 && point.recordedAtMs - prevTime < minTimeIntervalMs) return false
+        val state = lastRecordedState
+        if (state == null) return@withLock true
+        if (minTimeIntervalMs > 0 && point.recordedAtMs - state.timestampMs < minTimeIntervalMs) return@withLock false
         if (minDistanceMeters > 0.0) {
-            val dist = haversineMeters(prevLat, prevLng, point.lat, point.lng)
-            if (dist < minDistanceMeters) return false
+            val dist = haversineMeters(state.lat, state.lng, point.lat, point.lng)
+            if (dist < minDistanceMeters) return@withLock false
         }
-        return true
+        true
     }
 
-    fun markRecorded(point: LocationPoint) {
-        lastRecordedAtMs = point.recordedAtMs
-        lastLat = point.lat
-        lastLng = point.lng
+    /**
+     * Thread-safe mark a point as recorded.
+     */
+    suspend fun markRecorded(point: LocationPoint) = stateMutex.withLock {
+        lastRecordedState = RecordedState(point.recordedAtMs, point.lat, point.lng)
     }
 
     companion object {

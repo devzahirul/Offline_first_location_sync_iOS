@@ -92,6 +92,40 @@ class SqliteLocationStore(private val context: Context) : LocationStore, SentPoi
         }
     }
 
+    /**
+     * Atomic operation: mark points as sent AND prune old sent points in a single transaction.
+     * Prevents data loss if crash occurs between separate markSent + pruneSentPoints calls.
+     */
+    suspend fun markSentAndPrune(
+        pointIds: List<String>,
+        sentAtMs: Long,
+        olderThanRecordedMs: Long?
+    ) = withContext(Dispatchers.IO) {
+        if (pointIds.isEmpty()) return@withContext
+        val db = helper.writableDatabase
+        db.beginTransaction()
+        try {
+            // Mark sent
+            for (chunk in pointIds.chunked(999)) {
+                val placeholders = chunk.joinToString(",") { "?" }
+                db.execSQL(
+                    "UPDATE location_points SET sent_at = ?, failed_at = NULL WHERE id IN ($placeholders)",
+                    arrayOf(sentAtMs.toString()) + chunk.toTypedArray()
+                )
+            }
+            // Prune old sent points
+            if (olderThanRecordedMs != null) {
+                db.execSQL(
+                    "DELETE FROM location_points WHERE sent_at IS NOT NULL AND recorded_at_ms < ?",
+                    arrayOf(olderThanRecordedMs.toString())
+                )
+            }
+            db.setTransactionSuccessful()
+        } finally {
+            db.endTransaction()
+        }
+    }
+
     override suspend fun markFailed(pointIds: List<String>, errorMessage: String) = withContext(Dispatchers.IO) {
         if (pointIds.isEmpty()) return@withContext
         val db = helper.writableDatabase

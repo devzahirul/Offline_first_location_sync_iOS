@@ -45,7 +45,6 @@ class SyncEngine(
     private val flushMutex = Mutex()
     private var failureCount = 0
     private var nextAllowedFlushAtMs: Long? = null
-    private var lastPruneAtMs: Long? = null
     private var lastPullAtMs: Long? = null
     private var pendingInsertsSinceLastFlush = 0
     private var hasPendingData = false
@@ -194,14 +193,22 @@ class SyncEngine(
                     val sentAt = System.currentTimeMillis()
                     failureCount = 0
                     nextAllowedFlushAtMs = null
-                    if (result.acceptedIds.isNotEmpty()) store.markSent(result.acceptedIds, sentAt)
+                    if (result.acceptedIds.isNotEmpty()) {
+                        val prunable = store as? SentPointsPrunableLocationStore
+                        if (prunable != null) {
+                            // Use atomic operation to prevent data loss on crash
+                            val olderThanMs = retentionPolicy.sentPointsMaxAgeMs?.let { sentAt - it }
+                            prunable.markSentAndPrune(result.acceptedIds, sentAt, olderThanMs)
+                        } else {
+                            store.markSent(result.acceptedIds, sentAt)
+                        }
+                    }
                     if (result.rejected.isNotEmpty()) {
                         store.markFailed(result.rejected.map { it.id }, result.rejected.firstOrNull()?.reason ?: "rejected")
                     }
                     pendingInsertsSinceLastFlush = 0
                     _events.emit(SyncEngineEvent.UploadSuccess(result.acceptedIds.size, result.rejected.size))
                     batchesProcessed++
-                    maybePruneSentPoints(sentAt)
                     if (result.acceptedIds.isEmpty() && result.rejected.isEmpty()) break
                 } catch (e: Exception) {
                     scheduleBackoffAfterFailure()
@@ -232,20 +239,5 @@ class SyncEngine(
         failureCount = (failureCount + 1).coerceAtMost(30)
         val delayMs = retryPolicy.delayForAttempt(failureCount)
         nextAllowedFlushAtMs = System.currentTimeMillis() + delayMs
-    }
-
-    private suspend fun maybePruneSentPoints(nowMs: Long) {
-        val maxAgeMs = retentionPolicy.sentPointsMaxAgeMs ?: return
-        if (maxAgeMs <= 0) return
-        val minIntervalMs = 60 * 60 * 1000L
-        lastPruneAtMs?.let { last -> if (nowMs - last < minIntervalMs) return }
-        val prunable = store as? SentPointsPrunableLocationStore ?: run {
-            lastPruneAtMs = nowMs
-            return
-        }
-        try {
-            prunable.pruneSentPoints(olderThanRecordedMs = nowMs - maxAgeMs)
-        } catch (_: Exception) {}
-        lastPruneAtMs = nowMs
     }
 }

@@ -269,6 +269,62 @@ public actor SQLiteLocationStore: LocationStore, SentPointsPrunableLocationStore
         try mark(pointIds: pointIds, status: .sent, sentAt: sentAt, errorMessage: nil)
     }
 
+    /// Atomic operation: mark points as sent AND prune old sent points in a single transaction.
+    /// Prevents data loss if crash occurs between separate markSent + pruneSentPoints calls.
+    public func markSentAndPrune(pointIds: [UUID], sentAt: Date, olderThanRecordedAt: Date?) async throws {
+        guard !pointIds.isEmpty else { return }
+
+        try db.exec("BEGIN TRANSACTION;")
+        do {
+            // Mark sent
+            let chunkSize = 999
+            for chunk in stride(from: 0, to: pointIds.count, by: chunkSize).map({ Array(pointIds[$0..<min($0 + chunkSize, pointIds.count)]) }) {
+                let placeholders = chunk.map { _ in "?" }.joined(separator: ",")
+                let sql = """
+                UPDATE location_points
+                SET sync_status = ?, last_error = NULL, sent_at_ms = ?
+                WHERE id IN (\(placeholders));
+                """
+                let stmt = try db.prepare(sql)
+                defer { sqlite3_finalize(stmt) }
+
+                try bindInt(stmt, index: 1, value: SyncStatus.sent.rawValue)
+                try bindInt64(stmt, index: 2, value: Self.dateToMs(sentAt))
+                for (offset, id) in chunk.enumerated() {
+                    try bindText(stmt, index: Int32(3 + offset), value: id.uuidString)
+                }
+
+                guard sqlite3_step(stmt) == SQLITE_DONE else {
+                    throw SQLiteError.step(db.lastErrorMessage())
+                }
+            }
+
+            // Prune old sent points
+            if let olderThan = olderThanRecordedAt {
+                let pruneSql = """
+                DELETE FROM location_points
+                WHERE sync_status = ?
+                  AND sent_at_ms IS NOT NULL
+                  AND sent_at_ms < ?;
+                """
+                let pruneStmt = try db.prepare(pruneSql)
+                defer { sqlite3_finalize(pruneStmt) }
+
+                try bindInt(pruneStmt, index: 1, value: SyncStatus.sent.rawValue)
+                try bindInt64(pruneStmt, index: 2, value: Self.dateToMs(olderThan))
+
+                guard sqlite3_step(pruneStmt) == SQLITE_DONE else {
+                    throw SQLiteError.step(db.lastErrorMessage())
+                }
+            }
+
+            try db.exec("COMMIT;")
+        } catch {
+            try? db.exec("ROLLBACK;")
+            throw error
+        }
+    }
+
     public func markFailed(pointIds: [UUID], errorMessage: String) async throws {
         try mark(pointIds: pointIds, status: .failed, sentAt: nil, errorMessage: errorMessage)
     }
