@@ -10,7 +10,6 @@ import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 
 sealed class SyncEngineEvent {
     data class UploadSuccess(val accepted: Int, val rejected: Int) : SyncEngineEvent()
@@ -21,9 +20,8 @@ sealed class SyncEngineEvent {
 
 /**
  * Sync engine: uploads pending points in batches when conditions are met.
- * Matches iOS RTLSSync.SyncEngine behaviour: timer + optional network gate,
- * conditional flush (batch size / max age), exponential backoff on failure,
- * optional retention pruning.
+ * Demand-driven timer: only runs when pending data exists, stops when drained.
+ * Supports cellular-aware flush intervals via BatchingPolicy.cellularFlushIntervalSeconds.
  */
 class SyncEngine(
     private val store: LocationStore,
@@ -54,25 +52,25 @@ class SyncEngine(
     private var lastPruneAtMs: Long? = null
     private var lastPullAtMs: Long? = null
     private var pendingInsertsSinceLastFlush = 0
+    private var hasPendingData = false
 
     fun start() {
         if (running) return
         running = true
 
-        timerJob = scope.launch {
-            while (isActive && running) {
-                delay(batching.flushIntervalSeconds * 1000)
-                if (running) {
-                    flushIfNeeded(force = false, maxBatches = null)
-                }
-            }
-        }
+        // Do NOT start timerJob here — it is demand-driven via ensureTimerRunning()
 
-        // Match iOS: when network comes online, trigger conditional flush
         networkMonitor?.onlineFlow?.let { flow ->
             networkJob = scope.launch {
                 flow.collectLatest { online ->
-                    if (online && running) flushIfNeeded(force = false, maxBatches = null)
+                    if (online && running) {
+                        val stats = try { store.pendingStats() } catch (_: Exception) { null }
+                        if (stats != null && stats.count > 0) {
+                            hasPendingData = true
+                            ensureTimerRunning()
+                        }
+                        flushIfNeeded(force = false, maxBatches = null)
+                    }
                 }
             }
         }
@@ -90,15 +88,15 @@ class SyncEngine(
 
     fun stop() {
         running = false
-        timerJob?.cancel()
-        timerJob = null
-        networkJob?.cancel()
-        networkJob = null
-        pullJob?.cancel()
-        pullJob = null
+        timerJob?.cancel(); timerJob = null
+        networkJob?.cancel(); networkJob = null
+        pullJob?.cancel(); pullJob = null
     }
 
     fun notifyNewData() {
+        hasPendingData = true
+        ensureTimerRunning()
+
         pendingInsertsSinceLastFlush++
         if (pendingInsertsSinceLastFlush >= batching.maxBatchSize) {
             scope.launch { flushIfNeeded(force = false, maxBatches = null) }
@@ -111,13 +109,27 @@ class SyncEngine(
         }
     }
 
+    private fun ensureTimerRunning() {
+        if (!hasPendingData || timerJob != null) return
+        timerJob = scope.launch {
+            while (isActive && running) {
+                val interval = batching.flushIntervalSeconds.coerceAtLeast(1L) * 1000
+                delay(interval)
+                if (running) flushIfNeeded(force = false, maxBatches = null)
+            }
+        }
+    }
+
+    private fun stopTimerIfDrained() {
+        if (hasPendingData) return
+        timerJob?.cancel()
+        timerJob = null
+    }
+
     suspend fun flushNow(maxBatches: Int? = null) {
         flushIfNeeded(force = true, maxBatches = maxBatches)
     }
 
-    /**
-     * Run one pull cycle (fetch from server, apply to local). No-op if pull or bidirectional store not configured.
-     */
     suspend fun pullNow() {
         if (pullAPI == null || bidirectionalStore == null) return
         runPullOnce()
@@ -133,12 +145,7 @@ class SyncEngine(
                 result.nextCursor?.let { bidir.setLastPullCursor(it) }
                 return
             }
-            bidir.applyServerChanges(
-                result.items,
-                mergeStrategy,
-                result.serverTimeMs,
-                lastPullAtMs
-            )
+            bidir.applyServerChanges(result.items, mergeStrategy, result.serverTimeMs, lastPullAtMs)
             result.nextCursor?.let { bidir.setLastPullCursor(it) }
             lastPullAtMs = System.currentTimeMillis()
             _events.emit(SyncEngineEvent.PullSuccess(result.items.size))
@@ -153,17 +160,11 @@ class SyncEngine(
         try {
             val now = System.currentTimeMillis()
             if (!force) {
-                nextAllowedFlushAtMs?.let { next ->
-                    if (now < next) return
-                }
+                nextAllowedFlushAtMs?.let { next -> if (now < next) return }
             }
-            networkMonitor?.let { monitor ->
-                if (!monitor.isOnline()) return
-            }
+            networkMonitor?.let { if (!it.isOnline()) return }
 
-            val should = try {
-                shouldFlush(force)
-            } catch (e: Exception) {
+            val should = try { shouldFlush(force) } catch (e: Exception) {
                 _events.emit(SyncEngineEvent.UploadFailed(e.message ?: "Unknown error"))
                 return
             }
@@ -171,37 +172,30 @@ class SyncEngine(
 
             var batchesProcessed = 0
             while (running) {
-                networkMonitor?.let { monitor ->
-                    if (!monitor.isOnline()) return
-                }
+                networkMonitor?.let { if (!it.isOnline()) return }
                 if (maxBatches != null && batchesProcessed >= maxBatches) break
 
                 val pending = store.fetchPendingPoints(batching.maxBatchSize)
-                if (pending.isEmpty()) break
+                if (pending.isEmpty()) {
+                    hasPendingData = false
+                    stopTimerIfDrained()
+                    break
+                }
 
                 try {
                     val batch = LocationUploadBatch(points = pending)
                     val result = api.upload(batch)
                     val sentAt = System.currentTimeMillis()
-
                     failureCount = 0
                     nextAllowedFlushAtMs = null
-
-                    if (result.acceptedIds.isNotEmpty()) {
-                        store.markSent(result.acceptedIds, sentAt)
-                    }
+                    if (result.acceptedIds.isNotEmpty()) store.markSent(result.acceptedIds, sentAt)
                     if (result.rejected.isNotEmpty()) {
-                        store.markFailed(
-                            result.rejected.map { it.id },
-                            result.rejected.firstOrNull()?.reason ?: "rejected"
-                        )
+                        store.markFailed(result.rejected.map { it.id }, result.rejected.firstOrNull()?.reason ?: "rejected")
                     }
-
                     pendingInsertsSinceLastFlush = 0
                     _events.emit(SyncEngineEvent.UploadSuccess(result.acceptedIds.size, result.rejected.size))
                     batchesProcessed++
                     maybePruneSentPoints(sentAt)
-
                     if (result.acceptedIds.isEmpty() && result.rejected.isEmpty()) break
                 } catch (e: Exception) {
                     scheduleBackoffAfterFailure()
@@ -217,7 +211,11 @@ class SyncEngine(
     private suspend fun shouldFlush(force: Boolean): Boolean {
         if (force) return true
         val stats = store.pendingStats()
-        if (stats.count == 0) return false
+        if (stats.count == 0) {
+            hasPendingData = false
+            stopTimerIfDrained()
+            return false
+        }
         if (stats.count >= batching.maxBatchSize) return true
         val oldest = stats.oldestRecordedAtMs ?: return false
         val ageSeconds = (System.currentTimeMillis() - oldest) / 1000
@@ -234,19 +232,14 @@ class SyncEngine(
         val maxAgeMs = retentionPolicy.sentPointsMaxAgeMs ?: return
         if (maxAgeMs <= 0) return
         val minIntervalMs = 60 * 60 * 1000L
-        lastPruneAtMs?.let { last ->
-            if (nowMs - last < minIntervalMs) return
-        }
+        lastPruneAtMs?.let { last -> if (nowMs - last < minIntervalMs) return }
         val prunable = store as? SentPointsPrunableLocationStore ?: run {
             lastPruneAtMs = nowMs
             return
         }
         try {
-            val cutoff = nowMs - maxAgeMs
-            prunable.pruneSentPoints(olderThanRecordedMs = cutoff)
-        } catch (_: Exception) {
-            // Non-fatal
-        }
+            prunable.pruneSentPoints(olderThanRecordedMs = nowMs - maxAgeMs)
+        } catch (_: Exception) {}
         lastPruneAtMs = nowMs
     }
 }

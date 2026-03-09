@@ -17,6 +17,10 @@ public actor RealTimeLocationClient {
         public var reconnectBaseDelay: TimeInterval
         public var reconnectMaxDelay: TimeInterval
         public var pingInterval: TimeInterval
+        /// Ping interval used in background mode. Longer intervals allow cellular radio dormancy.
+        public var backgroundPingInterval: TimeInterval
+        /// When true, fully disconnect WebSocket when entering background.
+        public var disconnectInBackground: Bool
 
         public init(
             baseURL: URL,
@@ -24,7 +28,9 @@ public actor RealTimeLocationClient {
             autoReconnect: Bool = true,
             reconnectBaseDelay: TimeInterval = 1.0,
             reconnectMaxDelay: TimeInterval = 30.0,
-            pingInterval: TimeInterval = 30.0
+            pingInterval: TimeInterval = 30.0,
+            backgroundPingInterval: TimeInterval = 120.0,
+            disconnectInBackground: Bool = false
         ) {
             self.baseURL = baseURL
             self.tokenProvider = tokenProvider
@@ -32,6 +38,8 @@ public actor RealTimeLocationClient {
             self.reconnectBaseDelay = reconnectBaseDelay
             self.reconnectMaxDelay = reconnectMaxDelay
             self.pingInterval = pingInterval
+            self.backgroundPingInterval = backgroundPingInterval
+            self.disconnectInBackground = disconnectInBackground
         }
     }
 
@@ -54,6 +62,7 @@ public actor RealTimeLocationClient {
     private var receiveTask: Task<Void, Never>?
     private var reconnectTask: Task<Void, Never>?
     private var running = false
+    private var isBackgroundMode = false
     private var reconnectAttempt = 0
     private var subscribedUserIds: Set<String> = []
 
@@ -125,6 +134,29 @@ public actor RealTimeLocationClient {
         try? await sendJSON(msg)
     }
 
+    /// Switch between foreground/background ping intervals.
+    /// In background mode, ping interval increases to reduce radio wake-ups.
+    /// If `disconnectInBackground` is enabled, the WebSocket is fully disconnected.
+    public func setBackgroundMode(_ enabled: Bool) async {
+        guard isBackgroundMode != enabled else { return }
+        isBackgroundMode = enabled
+
+        if enabled && config.disconnectInBackground {
+            await disconnect()
+            return
+        }
+
+        if !enabled && config.disconnectInBackground && !running {
+            await connect()
+            return
+        }
+
+        // Restart ping loop with appropriate interval
+        if running {
+            startPingLoop()
+        }
+    }
+
     // MARK: - Private
 
     private func doConnect() async {
@@ -193,11 +225,16 @@ public actor RealTimeLocationClient {
         pingTask?.cancel()
         pingTask = Task { [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: UInt64((self?.config.pingInterval ?? 30) * 1_000_000_000))
+                let interval = await self?.activePingInterval ?? 30.0
+                try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
                 let msg: [String: Any] = ["type": "ping"]
                 try? await self?.sendJSON(msg)
             }
         }
+    }
+
+    private var activePingInterval: TimeInterval {
+        isBackgroundMode ? config.backgroundPingInterval : config.pingInterval
     }
 
     private func handleServerMessage(_ data: Data) {

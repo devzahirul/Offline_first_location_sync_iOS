@@ -63,10 +63,16 @@ class RtlsFlutterPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventC
         val app = (context as? Application) ?: return
         val callbacks = object : Application.ActivityLifecycleCallbacks {
             override fun onActivityResumed(activity: Activity) {
-                scope.launch { client?.flushNow() }
+                scope.launch {
+                    client?.setBackgroundMode(false)
+                    client?.flushNow()
+                }
             }
             override fun onActivityPaused(activity: Activity) {
-                scope.launch { client?.flushNow() }
+                scope.launch {
+                    client?.setBackgroundMode(true)
+                    client?.flushNow()
+                }
             }
             override fun onActivityCreated(a: Activity, b: Bundle?) {}
             override fun onActivityStarted(a: Activity) {}
@@ -212,6 +218,7 @@ class RtlsFlutterPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventC
                     )
                     else -> LocationRequestParams(
                         maxUpdateDelayMillis = 30_000L,
+                        useBalancedPowerAccuracy = true,
                         maxAcceptableAccuracyMeters = maxAccuracy
                     )
                 }

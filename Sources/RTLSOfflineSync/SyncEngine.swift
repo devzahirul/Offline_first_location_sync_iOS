@@ -26,6 +26,8 @@ public actor SyncEngine {
     private var pullTask: Task<Void, Never>?
     private var notifyDebounceTask: Task<Void, Never>?
     private var flushing = false
+    private var hasPendingData = false
+    private var cachedConnectionType: ConnectionType = .unknown
 
     private var failureCount = 0
     private var nextAllowedFlushAt: Date?
@@ -69,19 +71,18 @@ public actor SyncEngine {
     public func start() {
         Task { await network.start() }
 
-        timerTask?.cancel()
-        timerTask = Task { [batching] in
-            while !Task.isCancelled {
-                let interval = max(1.0, batching.flushInterval)
-                try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
-                await self.flushIfNeeded(force: false)
-            }
-        }
+        // Do NOT start timerTask here — it is demand-driven via ensureTimerRunning()
 
         networkTask?.cancel()
         networkTask = Task {
             for await online in network.updates {
+                self.cachedConnectionType = await network.connectionType()
                 if online {
+                    let stats = try? await self.store.pendingStats()
+                    if let stats, stats.count > 0 {
+                        self.hasPendingData = true
+                        self.ensureTimerRunning()
+                    }
                     await self.flushIfNeeded(force: false)
                 }
             }
@@ -92,7 +93,12 @@ public actor SyncEngine {
             pullTask?.cancel()
             pullTask = Task { [pullAPI, mergeStrategy] in
                 while !Task.isCancelled {
-                    try? await Task.sleep(nanoseconds: UInt64(max(1.0, interval) * 1_000_000_000))
+                    let sleepInterval = max(1.0, interval)
+                    if #available(iOS 16.0, macOS 13.0, *) {
+                        try? await Task.sleep(for: .seconds(sleepInterval), tolerance: .seconds(sleepInterval * 0.5))
+                    } else {
+                        try? await Task.sleep(nanoseconds: UInt64(sleepInterval * 1_000_000_000))
+                    }
                     await self.runPullOnce(pullAPI: pullAPI!, store: bidir, mergeStrategy: mergeStrategy)
                 }
             }
@@ -113,16 +119,53 @@ public actor SyncEngine {
     }
 
     public func notifyNewData() {
+        hasPendingData = true
+        ensureTimerRunning()
+
         pendingInsertsSinceLastFlush += 1
         if pendingInsertsSinceLastFlush >= batching.maxBatchSize {
             Task { await flushIfNeeded(force: false) }
             return
         }
+
+        let debounceInterval: TimeInterval = cachedConnectionType == .cellular ? 10.0 : 2.0
         notifyDebounceTask?.cancel()
         notifyDebounceTask = Task {
-            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            if #available(iOS 16.0, macOS 13.0, *) {
+                try? await Task.sleep(for: .seconds(debounceInterval), tolerance: .seconds(debounceInterval * 0.5))
+            } else {
+                try? await Task.sleep(nanoseconds: UInt64(debounceInterval * 1_000_000_000))
+            }
             await flushIfNeeded(force: false)
         }
+    }
+
+    private func ensureTimerRunning() {
+        guard hasPendingData, timerTask == nil else { return }
+        timerTask = Task { [batching] in
+            while !Task.isCancelled {
+                let baseInterval = max(1.0, batching.flushInterval)
+                let interval: TimeInterval
+                if let cellularInterval = batching.cellularFlushInterval,
+                   await self.cachedConnectionType == .cellular {
+                    interval = max(1.0, cellularInterval)
+                } else {
+                    interval = baseInterval
+                }
+                if #available(iOS 16.0, macOS 13.0, *) {
+                    try? await Task.sleep(for: .seconds(interval), tolerance: .seconds(interval * 0.5))
+                } else {
+                    try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
+                }
+                await self.flushIfNeeded(force: false)
+            }
+        }
+    }
+
+    private func stopTimerIfDrained() {
+        guard !hasPendingData else { return }
+        timerTask?.cancel()
+        timerTask = nil
     }
 
     public func flushNow(maxBatches: Int? = nil) async {
@@ -162,7 +205,11 @@ public actor SyncEngine {
 
             do {
                 let pending = try await store.fetchPendingPoints(limit: batching.maxBatchSize)
-                if pending.isEmpty { break }
+                if pending.isEmpty {
+                    hasPendingData = false
+                    stopTimerIfDrained()
+                    break
+                }
 
                 let result = try await api.upload(batch: LocationUploadBatch(points: pending))
                 let now = Date()
@@ -202,7 +249,11 @@ public actor SyncEngine {
         if force { return true }
 
         let stats = try await store.pendingStats()
-        if stats.count == 0 { return false }
+        if stats.count == 0 {
+            hasPendingData = false
+            stopTimerIfDrained()
+            return false
+        }
         if stats.count >= batching.maxBatchSize { return true }
 
         if let oldest = stats.oldestRecordedAt {

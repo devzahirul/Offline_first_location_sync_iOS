@@ -1,17 +1,26 @@
 import Foundation
 import Network
 
+public enum ConnectionType: Sendable, Equatable {
+    case wifi
+    case cellular
+    case unknown
+}
+
 public actor NetworkMonitor {
     private var monitor: NWPathMonitor?
     private let queue: DispatchQueue
 
     private var started = false
     private var online = false
+    private var _connectionType: ConnectionType = .unknown
 
     private let statusStream: AsyncStream<Bool>
     private let continuation: AsyncStream<Bool>.Continuation
 
     public nonisolated var updates: AsyncStream<Bool> { statusStream }
+
+    // Nonisolated access not available for actors; use connectionType() within actor-isolated contexts.
 
     public init() {
         self.monitor = nil
@@ -29,7 +38,15 @@ public actor NetworkMonitor {
         let newMonitor = NWPathMonitor()
         newMonitor.pathUpdateHandler = { [weak self] path in
             let isOnline = path.status == .satisfied
-            Task { await self?.setOnline(isOnline) }
+            let connType: ConnectionType
+            if path.usesInterfaceType(.wifi) {
+                connType = .wifi
+            } else if path.usesInterfaceType(.cellular) {
+                connType = .cellular
+            } else {
+                connType = .unknown
+            }
+            Task { await self?.setOnline(isOnline, connectionType: connType) }
         }
         newMonitor.start(queue: queue)
         monitor = newMonitor
@@ -45,8 +62,13 @@ public actor NetworkMonitor {
         online
     }
 
-    private func setOnline(_ value: Bool) {
+    public func connectionType() -> ConnectionType {
+        _connectionType
+    }
+
+    private func setOnline(_ value: Bool, connectionType: ConnectionType) {
         online = value
+        _connectionType = connectionType
         continuation.yield(value)
     }
 }

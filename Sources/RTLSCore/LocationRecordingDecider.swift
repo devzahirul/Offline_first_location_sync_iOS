@@ -34,6 +34,15 @@ public struct LocationRecordingDecider: Sendable, Equatable {
             guard meters > 0 else { return true }
             guard let lastRecordedCoordinate else { return true }
             return coordinate.distance(to: lastRecordedCoordinate) >= meters
+
+        case .adaptive:
+            // Adaptive is resolved by the orchestrator into a concrete sub-policy.
+            // If called directly, default to distance(25).
+            guard let lastRecordedCoordinate else { return true }
+            return coordinate.distance(to: lastRecordedCoordinate) >= 25.0
+
+        case .paused:
+            return false
         }
     }
 

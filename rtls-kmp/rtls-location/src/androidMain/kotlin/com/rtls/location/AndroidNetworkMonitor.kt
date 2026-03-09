@@ -6,6 +6,7 @@ import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
 import android.os.Build
+import com.rtls.core.ConnectionType
 import com.rtls.core.NetworkMonitor
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.awaitClose
@@ -25,6 +26,23 @@ class AndroidNetworkMonitor(private val context: Context) : NetworkMonitor {
         } else {
             @Suppress("DEPRECATION")
             cm.activeNetworkInfo?.isConnected == true
+        }
+    }
+
+    override suspend fun connectionType(): ConnectionType = withContext(Dispatchers.IO) {
+        val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+            ?: return@withContext ConnectionType.UNKNOWN
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            val network = cm.activeNetwork ?: return@withContext ConnectionType.UNKNOWN
+            val caps = cm.getNetworkCapabilities(network) ?: return@withContext ConnectionType.UNKNOWN
+            when {
+                caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED) -> ConnectionType.WIFI
+                caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> ConnectionType.CELLULAR
+                caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> ConnectionType.WIFI
+                else -> ConnectionType.UNKNOWN
+            }
+        } else {
+            ConnectionType.UNKNOWN
         }
     }
 

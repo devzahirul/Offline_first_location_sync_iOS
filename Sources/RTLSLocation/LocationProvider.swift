@@ -70,9 +70,9 @@ public final class LocationProvider: NSObject {
         public var useSignificantLocationChanges: Bool
 
         public init(
-            desiredAccuracy: CLLocationAccuracy = kCLLocationAccuracyBest,
+            desiredAccuracy: CLLocationAccuracy = kCLLocationAccuracyNearestTenMeters,
             activityType: CLActivityType = .other,
-            distanceFilter: CLLocationDistance = kCLDistanceFilterNone,
+            distanceFilter: CLLocationDistance = 10.0,
             pausesLocationUpdatesAutomatically: Bool = true,
             allowsBackgroundLocationUpdates: Bool = true,
             showsBackgroundLocationIndicator: Bool = false,
@@ -89,7 +89,7 @@ public final class LocationProvider: NSObject {
     }
 
     private let manager: CLLocationManager
-    private let configuration: Configuration
+    private var configuration: Configuration
 
     private let eventsStream: AsyncStream<LocationProviderEvent>
     private let continuation: AsyncStream<LocationProviderEvent>.Continuation
@@ -158,6 +158,30 @@ public final class LocationProvider: NSObject {
             manager.stopMonitoringSignificantLocationChanges()
         } else {
             manager.stopUpdatingLocation()
+        }
+    }
+
+    /// Reconfigure the location manager without stop/restart cycle.
+    /// Useful for adapting accuracy/distance filter based on motion state or power policy.
+    public func reconfigure(_ newConfig: Configuration) {
+        let wasSignificant = configuration.useSignificantLocationChanges
+        let isSignificant = newConfig.useSignificantLocationChanges
+
+        configuration = newConfig
+        manager.desiredAccuracy = newConfig.desiredAccuracy
+        manager.activityType = newConfig.activityType
+        manager.distanceFilter = newConfig.distanceFilter
+        manager.pausesLocationUpdatesAutomatically = newConfig.pausesLocationUpdatesAutomatically
+
+        // Switch between significant-change and continuous if needed
+        if wasSignificant != isSignificant {
+            if wasSignificant {
+                manager.stopMonitoringSignificantLocationChanges()
+                manager.startUpdatingLocation()
+            } else {
+                manager.stopUpdatingLocation()
+                manager.startMonitoringSignificantLocationChanges()
+            }
         }
     }
 

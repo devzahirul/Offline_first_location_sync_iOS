@@ -48,22 +48,27 @@ class SyncEngine(
     private var lastPruneAtMs: Long? = null
     private var lastPullAtMs: Long? = null
     private var pendingInsertsSinceLastFlush = 0
+    private var hasPendingData = false
+    private var cachedConnectionType: ConnectionType = ConnectionType.UNKNOWN
 
     fun start() {
         if (running) return
         running = true
 
-        timerJob = scope.launch {
-            while (isActive && running) {
-                delay(batching.flushIntervalSeconds * 1000)
-                if (running) flushIfNeeded(force = false, maxBatches = null)
-            }
-        }
+        // Do NOT start timerJob here — it is demand-driven via ensureTimerRunning()
 
         networkMonitor?.onlineFlow?.let { flow ->
             networkJob = scope.launch {
                 flow.collectLatest { online ->
-                    if (online && running) flushIfNeeded(force = false, maxBatches = null)
+                    cachedConnectionType = networkMonitor.connectionType()
+                    if (online && running) {
+                        val stats = try { store.pendingStats() } catch (_: Exception) { null }
+                        if (stats != null && stats.count > 0) {
+                            hasPendingData = true
+                            ensureTimerRunning()
+                        }
+                        flushIfNeeded(force = false, maxBatches = null)
+                    }
                 }
             }
         }
@@ -87,16 +92,44 @@ class SyncEngine(
     }
 
     fun notifyNewData() {
+        hasPendingData = true
+        ensureTimerRunning()
+
         pendingInsertsSinceLastFlush++
         if (pendingInsertsSinceLastFlush >= batching.maxBatchSize) {
             scope.launch { flushIfNeeded(force = false, maxBatches = null) }
             return
         }
+
+        val debounceMs = if (cachedConnectionType == ConnectionType.CELLULAR) 10_000L else 2_000L
         notifyDebounceJob?.cancel()
         notifyDebounceJob = scope.launch {
-            delay(2_000L)
+            delay(debounceMs)
             flushIfNeeded(force = false, maxBatches = null)
         }
+    }
+
+    private fun ensureTimerRunning() {
+        if (!hasPendingData || timerJob != null) return
+        timerJob = scope.launch {
+            while (isActive && running) {
+                val baseInterval = batching.flushIntervalSeconds.coerceAtLeast(1L) * 1000
+                val interval = if (batching.cellularFlushIntervalSeconds != null &&
+                    cachedConnectionType == ConnectionType.CELLULAR) {
+                    batching.cellularFlushIntervalSeconds.coerceAtLeast(1L) * 1000
+                } else {
+                    baseInterval
+                }
+                delay(interval)
+                if (running) flushIfNeeded(force = false, maxBatches = null)
+            }
+        }
+    }
+
+    private fun stopTimerIfDrained() {
+        if (hasPendingData) return
+        timerJob?.cancel()
+        timerJob = null
     }
 
     suspend fun flushNow(maxBatches: Int? = null) {
@@ -149,7 +182,11 @@ class SyncEngine(
                 if (maxBatches != null && batchesProcessed >= maxBatches) break
 
                 val pending = store.fetchPendingPoints(batching.maxBatchSize)
-                if (pending.isEmpty()) break
+                if (pending.isEmpty()) {
+                    hasPendingData = false
+                    stopTimerIfDrained()
+                    break
+                }
 
                 try {
                     val batch = LocationUploadBatch(points = pending)
@@ -180,7 +217,11 @@ class SyncEngine(
     private suspend fun shouldFlush(force: Boolean): Boolean {
         if (force) return true
         val stats = store.pendingStats()
-        if (stats.count == 0) return false
+        if (stats.count == 0) {
+            hasPendingData = false
+            stopTimerIfDrained()
+            return false
+        }
         if (stats.count >= batching.maxBatchSize) return true
         val oldest = stats.oldestRecordedAtMs ?: return false
         val ageSeconds = (System.currentTimeMillis() - oldest) / 1000

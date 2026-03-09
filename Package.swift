@@ -19,7 +19,10 @@ let package = Package(
         .target(
             name: "RTLSLocation",
             dependencies: ["RTLSCore"],
-            linkerSettings: [.linkedFramework("CoreLocation")]
+            linkerSettings: [
+                .linkedFramework("CoreLocation"),
+                .linkedFramework("CoreMotion"),
+            ]
         ),
         .target(
             name: "RTLSOfflineSync",

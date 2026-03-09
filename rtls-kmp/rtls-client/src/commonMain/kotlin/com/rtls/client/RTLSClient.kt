@@ -104,6 +104,9 @@ class RTLSClient(
     suspend fun subscribeToUser(userId: String) { webSocketClient?.subscribe(userId) }
     suspend fun unsubscribeFromUser(userId: String) { webSocketClient?.unsubscribe(userId) }
 
+    /** Switch WebSocket between foreground/background ping intervals. */
+    suspend fun setBackgroundMode(enabled: Boolean) { webSocketClient?.setBackgroundMode(enabled) }
+
     suspend fun flushNow() { syncEngine?.flushNow() }
     suspend fun pullNow() { syncEngine?.pullNow() }
 

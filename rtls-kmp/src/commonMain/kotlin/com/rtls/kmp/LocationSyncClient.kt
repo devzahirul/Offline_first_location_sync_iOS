@@ -91,4 +91,9 @@ class LocationSyncClient(
     suspend fun flushNow() {
         syncEngine.flushNow()
     }
+
+    /** No-op at this layer (no WebSocket). Override in subclass or use RTLSClient for WS support. */
+    suspend fun setBackgroundMode(enabled: Boolean) {
+        // Placeholder — WebSocket background mode is handled by RTLSClient when WS is available.
+    }
 }

@@ -23,8 +23,10 @@ data class LocationRequestParams(
     val intervalMillis: Long = 10_000L,
     val minUpdateIntervalMillis: Long = 10_000L,
     val minUpdateDistanceMeters: Float = 10f,
-    val maxUpdateDelayMillis: Long = 0L,
-    val useBalancedPowerAccuracy: Boolean = false,
+    /** Enable HW batching: 30s default lets the GPS chip batch updates, saving CPU wakes. */
+    val maxUpdateDelayMillis: Long = 30_000L,
+    /** Default to balanced power: uses WiFi/cell + GPS only when needed. */
+    val useBalancedPowerAccuracy: Boolean = true,
     val maxAcceptableAccuracyMeters: Float = 0f
 )
 

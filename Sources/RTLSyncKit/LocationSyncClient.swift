@@ -10,6 +10,8 @@ public enum LocationSyncClientEvent: Sendable, Equatable {
     case trackingStopped
     case recorded(LocationPoint)
     case syncEvent(SyncEngineEvent)
+    case motionStateChanged(MotionState)
+    case powerPolicyChanged(level: Float, action: PowerAction)
     case error(String)
 }
 
@@ -60,15 +62,32 @@ public struct LocationSyncClientConfiguration: Sendable {
         if let locationProviderConfiguration {
             self.locationProviderConfiguration = locationProviderConfiguration
         } else {
-            // Default distance filter matches the chosen tracking policy.
+            // Map tracking policy to sensible GPS accuracy/distance filter defaults.
+            let desiredAccuracy: CLLocationAccuracy
             let distanceFilter: Double
             switch trackingPolicy {
             case .time:
+                desiredAccuracy = kCLLocationAccuracyNearestTenMeters
                 distanceFilter = kCLDistanceFilterNone
             case .distance(let meters):
-                distanceFilter = meters
+                if meters >= 10 {
+                    desiredAccuracy = kCLLocationAccuracyNearestTenMeters
+                    distanceFilter = max(10, meters * 0.5)
+                } else {
+                    desiredAccuracy = kCLLocationAccuracyBest
+                    distanceFilter = meters
+                }
+            case .adaptive:
+                desiredAccuracy = kCLLocationAccuracyNearestTenMeters
+                distanceFilter = 10.0
+            case .paused:
+                desiredAccuracy = kCLLocationAccuracyThreeKilometers
+                distanceFilter = 1000.0
             }
-            self.locationProviderConfiguration = LocationProvider.Configuration(distanceFilter: distanceFilter)
+            self.locationProviderConfiguration = LocationProvider.Configuration(
+                desiredAccuracy: desiredAccuracy,
+                distanceFilter: distanceFilter
+            )
         }
     }
 
@@ -94,16 +113,28 @@ public actor LocationSyncClient {
 
     private var locationTask: Task<Void, Never>?
     private var syncEventsTask: Task<Void, Never>?
+    private var motionTask: Task<Void, Never>?
+    private var batteryTask: Task<Void, Never>?
 
     private var isTracking = false
     private var recordingDecider: LocationRecordingDecider
+    private var currentMotionState: MotionState = .unknown
+    private let motionStateProvider: (any MotionStateProvider)?
+    private let powerPolicy: PowerPolicy?
+    private var currentPowerAction: PowerAction = .normal
 
     private let eventsStream: AsyncStream<LocationSyncClientEvent>
     private let continuation: AsyncStream<LocationSyncClientEvent>.Continuation
     public nonisolated var events: AsyncStream<LocationSyncClientEvent> { eventsStream }
 
-    public init(configuration: LocationSyncClientConfiguration) async throws {
+    public init(
+        configuration: LocationSyncClientConfiguration,
+        motionStateProvider: (any MotionStateProvider)? = nil,
+        powerPolicy: PowerPolicy? = nil
+    ) async throws {
         self.config = configuration
+        self.motionStateProvider = motionStateProvider
+        self.powerPolicy = powerPolicy
         self.store = try await SQLiteLocationStore(databaseURL: configuration.databaseURL)
         self.api = URLSessionLocationSyncAPI(baseURL: configuration.baseURL, tokenProvider: configuration.authTokenProvider)
         self.syncEngine = SyncEngine(
@@ -149,12 +180,18 @@ public actor LocationSyncClient {
             provider.startUpdatingLocation()
         }
 
+        wireMotionStateIfNeeded()
         continuation.yield(.trackingStarted)
     }
 
     public func stopTracking() async {
         guard isTracking else { return }
         isTracking = false
+
+        motionTask?.cancel()
+        motionTask = nil
+        batteryTask?.cancel()
+        batteryTask = nil
 
         await MainActor.run {
             provider.stopUpdatingLocation()
@@ -213,6 +250,112 @@ public actor LocationSyncClient {
             )
         )
         return await subscriber.subscribe(userId: userId)
+    }
+
+    // MARK: - Motion & Power
+
+    private func wireMotionStateIfNeeded() {
+        guard case .adaptive(let stationary, let walking, let driving) = config.trackingPolicy,
+              let motionProvider = motionStateProvider else { return }
+
+        motionTask?.cancel()
+        motionTask = Task {
+            for await state in motionProvider.motionStates {
+                guard self.isTracking else { continue }
+                self.currentMotionState = state
+                self.continuation.yield(.motionStateChanged(state))
+
+                let subPolicy: TrackingPolicy
+                switch state {
+                case .stationary:
+                    subPolicy = stationary
+                case .walking:
+                    subPolicy = walking
+                case .running:
+                    subPolicy = walking
+                case .driving:
+                    subPolicy = driving
+                case .unknown:
+                    subPolicy = walking
+                }
+
+                await self.applyTrackingPolicy(subPolicy)
+            }
+        }
+    }
+
+    private func applyTrackingPolicy(_ policy: TrackingPolicy) async {
+        // Skip if we're in a power-constrained state
+        if currentPowerAction == .pauseTracking { return }
+
+        let newConfig: LocationProvider.Configuration
+        switch policy {
+        case .paused:
+            newConfig = LocationProvider.Configuration(
+                desiredAccuracy: kCLLocationAccuracyThreeKilometers,
+                distanceFilter: 1000.0,
+                useSignificantLocationChanges: true
+            )
+        case .distance(let meters):
+            if meters >= 10 {
+                newConfig = LocationProvider.Configuration(
+                    desiredAccuracy: kCLLocationAccuracyNearestTenMeters,
+                    distanceFilter: max(10, meters * 0.5)
+                )
+            } else {
+                newConfig = LocationProvider.Configuration(
+                    desiredAccuracy: kCLLocationAccuracyBest,
+                    distanceFilter: meters
+                )
+            }
+        case .time:
+            newConfig = LocationProvider.Configuration(
+                desiredAccuracy: kCLLocationAccuracyNearestTenMeters
+            )
+        case .adaptive:
+            return
+        }
+
+        recordingDecider.policy = policy
+        await MainActor.run {
+            provider.reconfigure(newConfig)
+        }
+    }
+
+    /// Apply power action constraints — called from battery monitor.
+    public func applyPowerAction(_ action: PowerAction, batteryLevel: Float) async {
+        currentPowerAction = action
+        continuation.yield(.powerPolicyChanged(level: batteryLevel, action: action))
+
+        switch action {
+        case .normal:
+            // Restore original tracking policy
+            if case .adaptive = config.trackingPolicy {
+                // Let motion state re-apply
+            } else {
+                await applyTrackingPolicy(config.trackingPolicy)
+            }
+        case .reducedTracking:
+            await MainActor.run {
+                provider.reconfigure(LocationProvider.Configuration(
+                    desiredAccuracy: kCLLocationAccuracyHundredMeters,
+                    distanceFilter: 100.0,
+                    useSignificantLocationChanges: true
+                ))
+            }
+        case .wifiOnlySync:
+            await MainActor.run {
+                provider.reconfigure(LocationProvider.Configuration(
+                    desiredAccuracy: kCLLocationAccuracyHundredMeters,
+                    distanceFilter: 100.0,
+                    useSignificantLocationChanges: true
+                ))
+            }
+        case .pauseTracking:
+            await MainActor.run {
+                provider.stopUpdatingLocation()
+            }
+        }
     }
 
     // MARK: - Wiring

@@ -47,6 +47,7 @@ class RealTimeLocationClient(
     private var pingJob: Job? = null
     private var reconnectJob: Job? = null
     private var running = false
+    private var isBackgroundMode = false
     private var reconnectAttempt = 0
     private val subscribedUserIds = mutableSetOf<String>()
 
@@ -86,6 +87,29 @@ class RealTimeLocationClient(
         subscribedUserIds.remove(userId)
         if (channel.isConnected) {
             channel.send(json.encodeToString(WsUnsubscribe(userId = userId)))
+        }
+    }
+
+    /**
+     * Switch between foreground/background ping intervals.
+     * In background mode, ping interval increases to reduce radio wake-ups.
+     * If [WebSocketConfig.disconnectInBackground] is enabled, the WebSocket is fully disconnected.
+     */
+    suspend fun setBackgroundMode(enabled: Boolean) {
+        if (isBackgroundMode == enabled) return
+        isBackgroundMode = enabled
+
+        if (enabled && config.disconnectInBackground) {
+            disconnect()
+            return
+        }
+        if (!enabled && config.disconnectInBackground && !running) {
+            connect()
+            return
+        }
+        // Restart ping loop with appropriate interval
+        if (running && channel.isConnected) {
+            startPingLoop()
         }
     }
 
@@ -137,7 +161,8 @@ class RealTimeLocationClient(
         pingJob?.cancel()
         pingJob = scope.launch {
             while (isActive && channel.isConnected) {
-                delay(config.pingIntervalMs)
+                val interval = if (isBackgroundMode) config.backgroundPingIntervalMs else config.pingIntervalMs
+                delay(interval)
                 try { channel.send(json.encodeToString(WsPing())) } catch (_: Exception) { break }
             }
         }

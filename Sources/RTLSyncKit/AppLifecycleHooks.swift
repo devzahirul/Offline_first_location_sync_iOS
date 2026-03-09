@@ -2,6 +2,7 @@ import Foundation
 
 #if canImport(UIKit) && os(iOS)
 import UIKit
+import RTLSWebSocket
 
 /// Convenience hooks to trigger a flush on foreground/background transitions and (optionally) schedule BG processing.
 ///
@@ -9,15 +10,18 @@ import UIKit
 public final class RTLSAppLifecycleHooks: NSObject {
     private let client: LocationSyncClient
     private let backgroundProcessing: BackgroundProcessingConfiguration?
+    private let webSocketClient: RealTimeLocationClient?
 
     private var started = false
 
     public init(
         client: LocationSyncClient,
-        backgroundProcessing: BackgroundProcessingConfiguration? = nil
+        backgroundProcessing: BackgroundProcessingConfiguration? = nil,
+        webSocketClient: RealTimeLocationClient? = nil
     ) {
         self.client = client
         self.backgroundProcessing = backgroundProcessing
+        self.webSocketClient = webSocketClient
         super.init()
     }
 
@@ -43,12 +47,14 @@ public final class RTLSAppLifecycleHooks: NSObject {
 
     @objc private func willEnterForeground() {
         Task {
+            await webSocketClient?.setBackgroundMode(false)
             await client.pullNow()
             await client.flushNow()
         }
     }
 
     @objc private func didEnterBackground() {
+        Task { await webSocketClient?.setBackgroundMode(true) }
         // Schedule a background task so the system can run sync later (e.g. ~15 min),
         // even if the app is terminated after this. Location does NOT continue after terminate.
         if let backgroundProcessing {
