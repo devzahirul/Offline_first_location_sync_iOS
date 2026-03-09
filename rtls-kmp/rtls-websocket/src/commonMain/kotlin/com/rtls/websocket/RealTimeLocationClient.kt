@@ -161,12 +161,21 @@ class RealTimeLocationClient(
         pingJob?.cancel()
         pingJob = scope.launch {
             while (isActive && channel.isConnected) {
-                val interval = if (isBackgroundMode) config.backgroundPingIntervalMs else config.pingIntervalMs
+                val interval = activePingIntervalMs
                 delay(interval)
                 try { channel.send(json.encodeToString(WsPing())) } catch (_: Exception) { break }
             }
         }
     }
+
+    private val activePingIntervalMs: Long
+        get() = if (!isBackgroundMode) {
+            config.pingIntervalMs
+        } else {
+            // In background mode, use cellular interval by default for maximum battery savings
+            // For full cellular-aware logic, pass NetworkMonitor and check connection type
+            config.cellularBackgroundPingIntervalMs
+        }
 
     private suspend fun handleServerMessage(raw: String) {
         try {

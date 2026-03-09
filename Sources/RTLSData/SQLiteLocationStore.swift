@@ -1,6 +1,7 @@
 import Foundation
 import RTLSCore
 import SQLite3
+import os.log
 
 public actor SQLiteLocationStore: LocationStore, SentPointsPrunableLocationStore, BidirectionalLocationStore {
     private nonisolated let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
@@ -141,7 +142,16 @@ public actor SQLiteLocationStore: LocationStore, SentPointsPrunableLocationStore
 
             try db.exec("COMMIT;")
         } catch {
-            try? db.exec("ROLLBACK;")
+            // Attempt rollback and log any errors from both the original operation and rollback
+            do {
+                try db.exec("ROLLBACK;")
+            } catch let rollbackError {
+                // Log rollback failure - this indicates serious DB corruption
+                os_log(.error, "RTLS: Transaction failed and rollback also failed: %{public}@. Original error: %{public}@",
+                       rollbackError.localizedDescription, error.localizedDescription)
+                // Throw composite error to preserve both errors
+                throw SQLiteError.transactionFailed(original: error, rollback: rollbackError)
+            }
             throw error
         }
     }

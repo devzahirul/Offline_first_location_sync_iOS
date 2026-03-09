@@ -49,6 +49,13 @@ public struct LocationSyncClientConfiguration: Sendable {
         databaseURL: URL,
         locationProviderConfiguration: LocationProvider.Configuration? = nil
     ) {
+        // Enforce HTTPS for security - location data and auth tokens must not be transmitted in cleartext
+        precondition(
+            baseURL.scheme == "https",
+            "RTLS requires HTTPS for security. Use https:// in baseURL (\(baseURL)). " +
+            "In development, you may use a self-signed certificate, but never transmit " +
+            "location data or auth tokens over plaintext HTTP."
+        )
         self.baseURL = baseURL
         self.authTokenProvider = authTokenProvider
         self.userId = userId
@@ -150,24 +157,18 @@ public actor LocationSyncClient {
         self.eventsStream = stream
         self.continuation = continuation
 
-        self.provider = await MainActor.run {
-            LocationProvider(configuration: configuration.locationProviderConfiguration)
-        }
+        self.provider = LocationProvider(configuration: configuration.locationProviderConfiguration)
 
         await wireSyncEvents()
         await wireProviderEvents()
     }
 
     public func requestAlwaysAuthorization() async {
-        await MainActor.run {
-            provider.requestAlwaysAuthorization()
-        }
+        provider.requestAlwaysAuthorization()
     }
 
     public func requestWhenInUseAuthorization() async {
-        await MainActor.run {
-            provider.requestWhenInUseAuthorization()
-        }
+        provider.requestWhenInUseAuthorization()
     }
 
     public func startTracking() async {
@@ -176,9 +177,7 @@ public actor LocationSyncClient {
 
         await syncEngine.start()
 
-        await MainActor.run {
-            provider.startUpdatingLocation()
-        }
+        provider.startUpdatingLocation()
 
         wireMotionStateIfNeeded()
         continuation.yield(.trackingStarted)
@@ -193,9 +192,7 @@ public actor LocationSyncClient {
         batteryTask?.cancel()
         batteryTask = nil
 
-        await MainActor.run {
-            provider.stopUpdatingLocation()
-        }
+        provider.stopUpdatingLocation()
 
         await syncEngine.stop()
 
@@ -317,9 +314,7 @@ public actor LocationSyncClient {
         }
 
         recordingDecider.policy = policy
-        await MainActor.run {
-            provider.reconfigure(newConfig)
-        }
+        provider.reconfigure(newConfig)
     }
 
     /// Apply power action constraints — called from battery monitor.
@@ -336,25 +331,19 @@ public actor LocationSyncClient {
                 await applyTrackingPolicy(config.trackingPolicy)
             }
         case .reducedTracking:
-            await MainActor.run {
-                provider.reconfigure(LocationProvider.Configuration(
-                    desiredAccuracy: kCLLocationAccuracyHundredMeters,
-                    distanceFilter: 100.0,
-                    useSignificantLocationChanges: true
-                ))
-            }
+            provider.reconfigure(LocationProvider.Configuration(
+                desiredAccuracy: kCLLocationAccuracyHundredMeters,
+                distanceFilter: 100.0,
+                useSignificantLocationChanges: true
+            ))
         case .wifiOnlySync:
-            await MainActor.run {
-                provider.reconfigure(LocationProvider.Configuration(
-                    desiredAccuracy: kCLLocationAccuracyHundredMeters,
-                    distanceFilter: 100.0,
-                    useSignificantLocationChanges: true
-                ))
-            }
+            provider.reconfigure(LocationProvider.Configuration(
+                desiredAccuracy: kCLLocationAccuracyHundredMeters,
+                distanceFilter: 100.0,
+                useSignificantLocationChanges: true
+            ))
         case .pauseTracking:
-            await MainActor.run {
-                provider.stopUpdatingLocation()
-            }
+            provider.stopUpdatingLocation()
         }
     }
 
@@ -362,7 +351,7 @@ public actor LocationSyncClient {
 
     private func wireProviderEvents() async {
         locationTask?.cancel()
-        locationTask = Task { @MainActor [provider] in
+        locationTask = Task { [provider] in
             for await event in provider.events {
                 await self.handle(providerEvent: event)
             }

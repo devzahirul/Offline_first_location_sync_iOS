@@ -19,6 +19,9 @@ public actor RealTimeLocationClient {
         public var pingInterval: TimeInterval
         /// Ping interval used in background mode. Longer intervals allow cellular radio dormancy.
         public var backgroundPingInterval: TimeInterval
+        /// Ping interval used in background mode on cellular networks. Defaults to 5 minutes
+        /// to allow cellular radio to enter low-power state between pings.
+        public var cellularBackgroundPingInterval: TimeInterval
         /// When true, fully disconnect WebSocket when entering background.
         public var disconnectInBackground: Bool
 
@@ -30,6 +33,7 @@ public actor RealTimeLocationClient {
             reconnectMaxDelay: TimeInterval = 30.0,
             pingInterval: TimeInterval = 30.0,
             backgroundPingInterval: TimeInterval = 120.0,
+            cellularBackgroundPingInterval: TimeInterval = 300.0,
             disconnectInBackground: Bool = false
         ) {
             self.baseURL = baseURL
@@ -39,6 +43,7 @@ public actor RealTimeLocationClient {
             self.reconnectMaxDelay = reconnectMaxDelay
             self.pingInterval = pingInterval
             self.backgroundPingInterval = backgroundPingInterval
+            self.cellularBackgroundPingInterval = cellularBackgroundPingInterval
             self.disconnectInBackground = disconnectInBackground
         }
     }
@@ -56,6 +61,7 @@ public actor RealTimeLocationClient {
 
     private let config: Configuration
     private let session: URLSession
+    private let networkMonitor: NetworkMonitor
 
     private var webSocketTask: URLSessionWebSocketTask?
     private var pingTask: Task<Void, Never>?
@@ -74,10 +80,12 @@ public actor RealTimeLocationClient {
 
     public init(
         configuration: Configuration,
-        session: URLSession = .shared
+        session: URLSession = .shared,
+        networkMonitor: NetworkMonitor = NetworkMonitor()
     ) {
         self.config = configuration
         self.session = session
+        self.networkMonitor = networkMonitor
 
         let (evStream, evCont) = AsyncStream<Event>.makeStream(bufferingPolicy: .bufferingNewest(256))
         self.events = evStream
@@ -234,7 +242,15 @@ public actor RealTimeLocationClient {
     }
 
     private var activePingInterval: TimeInterval {
-        isBackgroundMode ? config.backgroundPingInterval : config.pingInterval
+        guard isBackgroundMode else { return config.pingInterval }
+        // In background mode, choose interval based on network type
+        // Cellular uses longer interval to allow radio dormancy
+        switch networkMonitor.connectionType() {
+        case .cellular:
+            return config.cellularBackgroundPingInterval
+        case .wifi, .unknown:
+            return config.backgroundPingInterval
+        }
     }
 
     private func handleServerMessage(_ data: Data) {

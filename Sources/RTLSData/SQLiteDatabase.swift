@@ -7,6 +7,7 @@ enum SQLiteError: Error, CustomStringConvertible {
     case step(String)
     case bind(String)
     case exec(String)
+    case transactionFailed(original: Error, rollback: Error)
 
     var description: String {
         switch self {
@@ -15,6 +16,8 @@ enum SQLiteError: Error, CustomStringConvertible {
         case .step(let msg): return "SQLite step error: \(msg)"
         case .bind(let msg): return "SQLite bind error: \(msg)"
         case .exec(let msg): return "SQLite exec error: \(msg)"
+        case .transactionFailed(let original, let rollback):
+            return "SQLite transaction failed: \(original.localizedDescription). Rollback also failed: \(rollback.localizedDescription)"
         }
     }
 }

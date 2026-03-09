@@ -25,9 +25,16 @@ data class LocationRequestParams(
     val minUpdateIntervalMillis: Long = 10_000L,
     val minUpdateDistanceMeters: Float = 10f,
     /** Hardware-level batching: buffer updates for up to this long before waking the CPU.
-     *  0 = deliver immediately (no batching). Higher = less CPU wake-ups = major power saving.
-     *  Recommended: 2-5x intervalMillis (e.g. 30_000-60_000 for 10s interval). */
-    val maxUpdateDelayMillis: Long = 0L,
+     *  This is a CRITICAL battery optimization - the Fused Location Provider buffers location
+     *  updates and delivers them in a batch, allowing the GPS hardware to power down between batches.
+     *
+     *  Default: 30_000ms (30 seconds) - provides good balance between real-time updates and battery life.
+     *  For near-real-time: 5_000ms (5 seconds)
+     *  For maximum battery: 60_000ms (60 seconds)
+     *
+     *  Recommended: 2-5x intervalMillis (e.g., 30_000-60_000 for 10s interval).
+     *  Set to 0L only if you need every location update delivered immediately (significant battery drain). */
+    val maxUpdateDelayMillis: Long = 30_000L,
     /** Use balanced power accuracy (WiFi/cell) instead of high accuracy (GPS).
      *  Sufficient for most sync use cases; saves significant battery. */
     val useBalancedPowerAccuracy: Boolean = false,
@@ -90,11 +97,7 @@ class AndroidLocationProvider(private val context: Context) {
         val request = LocationRequest.Builder(priority, params.intervalMillis)
             .setMinUpdateIntervalMillis(params.minUpdateIntervalMillis)
             .setMinUpdateDistanceMeters(params.minUpdateDistanceMeters)
-            .apply {
-                if (params.maxUpdateDelayMillis > 0) {
-                    setMaxUpdateDelayMillis(params.maxUpdateDelayMillis)
-                }
-            }
+            .setMaxUpdateDelayMillis(params.maxUpdateDelayMillis)
             .build()
 
         val maxAcc = params.maxAcceptableAccuracyMeters

@@ -55,8 +55,12 @@ public enum LocationProviderEvent: Sendable, Equatable {
     case didFail(String)
 }
 
-@MainActor
-public final class LocationProvider: NSObject {
+/// Location provider wrapper around CLLocationManager.
+///
+/// - Note: This class is NOT @MainActor. CLLocationManager delegate callbacks are
+///   delivered on the main thread by default, but the class itself is thread-safe
+///   and can be called from any actor. Use `MainActor.run` only when UI access is needed.
+public final class LocationProvider: NSObject, @unchecked Sendable {
     public struct Configuration: Sendable, Equatable {
         public var desiredAccuracy: CLLocationAccuracy
         public var activityType: CLActivityType
@@ -109,78 +113,91 @@ public final class LocationProvider: NSObject {
 
         super.init()
 
-        manager.delegate = self
-        manager.desiredAccuracy = configuration.desiredAccuracy
-        manager.activityType = configuration.activityType
-        manager.distanceFilter = configuration.distanceFilter
-        manager.pausesLocationUpdatesAutomatically = configuration.pausesLocationUpdatesAutomatically
-        // `allowsBackgroundLocationUpdates = true` will throw an Objective-C exception at runtime
-        // if the host app has not enabled Background Modes -> Location updates (UIBackgroundModes includes "location").
-        //
-        // Swift cannot catch NSException, so we must guard it.
-        if configuration.allowsBackgroundLocationUpdates && Self.isLocationBackgroundModeEnabled() {
-            manager.allowsBackgroundLocationUpdates = true
-        } else {
-            manager.allowsBackgroundLocationUpdates = false
-            if configuration.allowsBackgroundLocationUpdates && !Self.isLocationBackgroundModeEnabled() {
-                continuation.yield(
-                    .didFail(
-                        "Background location updates requested, but UIBackgroundModes is missing \"location\". Enable Background Modes -> Location updates in Xcode or set UIBackgroundModes=[\"location\", ...] in Info.plist."
+        // CLLocationManager must be initialized on main thread
+        Task { @MainActor in
+            manager.delegate = self
+            manager.desiredAccuracy = configuration.desiredAccuracy
+            manager.activityType = configuration.activityType
+            manager.distanceFilter = configuration.distanceFilter
+            manager.pausesLocationUpdatesAutomatically = configuration.pausesLocationUpdatesAutomatically
+            // `allowsBackgroundLocationUpdates = true` will throw an Objective-C exception at runtime
+            // if the host app has not enabled Background Modes -> Location updates (UIBackgroundModes includes "location").
+            //
+            // Swift cannot catch NSException, so we must guard it.
+            if configuration.allowsBackgroundLocationUpdates && Self.isLocationBackgroundModeEnabled() {
+                manager.allowsBackgroundLocationUpdates = true
+            } else {
+                manager.allowsBackgroundLocationUpdates = false
+                if configuration.allowsBackgroundLocationUpdates && !Self.isLocationBackgroundModeEnabled() {
+                    continuation.yield(
+                        .didFail(
+                            "Background location updates requested, but UIBackgroundModes is missing \"location\". Enable Background Modes -> Location updates in Xcode or set UIBackgroundModes=[\"location\", ...] in Info.plist."
+                        )
                     )
-                )
+                }
             }
-        }
-        #if os(iOS)
-        manager.showsBackgroundLocationIndicator = configuration.showsBackgroundLocationIndicator
-        #endif
+            #if os(iOS)
+            manager.showsBackgroundLocationIndicator = configuration.showsBackgroundLocationIndicator
+            #endif
 
-        continuation.yield(.authorizationChanged(LocationAuthorization(manager.authorizationStatus)))
+            continuation.yield(.authorizationChanged(LocationAuthorization(manager.authorizationStatus)))
+        }
     }
 
     public func requestWhenInUseAuthorization() {
-        manager.requestWhenInUseAuthorization()
+        Task { @MainActor in
+            manager.requestWhenInUseAuthorization()
+        }
     }
 
     public func requestAlwaysAuthorization() {
-        manager.requestAlwaysAuthorization()
+        Task { @MainActor in
+            manager.requestAlwaysAuthorization()
+        }
     }
 
     public func startUpdatingLocation() {
-        if configuration.useSignificantLocationChanges {
-            manager.startMonitoringSignificantLocationChanges()
-        } else {
-            manager.startUpdatingLocation()
+        Task { @MainActor in
+            if configuration.useSignificantLocationChanges {
+                manager.startMonitoringSignificantLocationChanges()
+            } else {
+                manager.startUpdatingLocation()
+            }
         }
     }
 
     public func stopUpdatingLocation() {
-        if configuration.useSignificantLocationChanges {
-            manager.stopMonitoringSignificantLocationChanges()
-        } else {
-            manager.stopUpdatingLocation()
+        Task { @MainActor in
+            if configuration.useSignificantLocationChanges {
+                manager.stopMonitoringSignificantLocationChanges()
+            } else {
+                manager.stopUpdatingLocation()
+            }
         }
     }
 
     /// Reconfigure the location manager without stop/restart cycle.
     /// Useful for adapting accuracy/distance filter based on motion state or power policy.
     public func reconfigure(_ newConfig: Configuration) {
-        let wasSignificant = configuration.useSignificantLocationChanges
-        let isSignificant = newConfig.useSignificantLocationChanges
+        Task { @MainActor in
+            let wasSignificant = configuration.useSignificantLocationChanges
+            let isSignificant = newConfig.useSignificantLocationChanges
 
-        configuration = newConfig
-        manager.desiredAccuracy = newConfig.desiredAccuracy
-        manager.activityType = newConfig.activityType
-        manager.distanceFilter = newConfig.distanceFilter
-        manager.pausesLocationUpdatesAutomatically = newConfig.pausesLocationUpdatesAutomatically
+            configuration = newConfig
+            manager.desiredAccuracy = newConfig.desiredAccuracy
+            manager.activityType = newConfig.activityType
+            manager.distanceFilter = newConfig.distanceFilter
+            manager.pausesLocationUpdatesAutomatically = newConfig.pausesLocationUpdatesAutomatically
 
-        // Switch between significant-change and continuous if needed
-        if wasSignificant != isSignificant {
-            if wasSignificant {
-                manager.stopMonitoringSignificantLocationChanges()
-                manager.startUpdatingLocation()
-            } else {
-                manager.stopUpdatingLocation()
-                manager.startMonitoringSignificantLocationChanges()
+            // Switch between significant-change and continuous if needed
+            if wasSignificant != isSignificant {
+                if wasSignificant {
+                    manager.stopMonitoringSignificantLocationChanges()
+                    manager.startUpdatingLocation()
+                } else {
+                    manager.stopUpdatingLocation()
+                    manager.startMonitoringSignificantLocationChanges()
+                }
             }
         }
     }
@@ -196,7 +213,7 @@ public final class LocationProvider: NSObject {
     }
 }
 
-extension LocationProvider: @preconcurrency CLLocationManagerDelegate {
+extension LocationProvider: CLLocationManagerDelegate {
     public func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
         continuation.yield(.authorizationChanged(LocationAuthorization(manager.authorizationStatus)))
     }

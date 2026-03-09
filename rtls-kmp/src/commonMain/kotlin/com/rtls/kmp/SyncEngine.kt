@@ -10,12 +10,22 @@ import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.withTimeoutOrNull
 
 sealed class SyncEngineEvent {
     data class UploadSuccess(val accepted: Int, val rejected: Int) : SyncEngineEvent()
     data class UploadFailed(val message: String) : SyncEngineEvent()
     data class PullSuccess(val count: Int) : SyncEngineEvent()
     data class PullFailed(val message: String) : SyncEngineEvent()
+}
+
+/** Explicit state machine for sync engine state tracking */
+sealed class SyncState {
+    object Stopped : SyncState()
+    object Idle : SyncState()
+    data class Flushing(val batchesProcessed: Int) : SyncState()
+    data class Backoff(val attempt: Int, val nextAttemptAtMs: Long) : SyncState()
+    data class Error(val message: String) : SyncState()
 }
 
 /**
@@ -47,6 +57,7 @@ class SyncEngine(
     private var notifyDebounceJob: Job? = null
     private var running = false
     private val flushMutex = Mutex()
+    private var currentState: SyncState = SyncState.Stopped
     private var failureCount = 0
     private var nextAllowedFlushAtMs: Long? = null
     private var lastPruneAtMs: Long? = null
@@ -54,9 +65,13 @@ class SyncEngine(
     private var pendingInsertsSinceLastFlush = 0
     private var hasPendingData = false
 
+    // Lock timeout for flush operations - prevents indefinite blocking
+    private val flushLockTimeoutMs = 5_000L
+
     fun start() {
         if (running) return
         running = true
+        currentState = SyncState.Idle
 
         // Do NOT start timerJob here — it is demand-driven via ensureTimerRunning()
 
@@ -88,6 +103,7 @@ class SyncEngine(
 
     fun stop() {
         running = false
+        currentState = SyncState.Stopped
         timerJob?.cancel(); timerJob = null
         networkJob?.cancel(); networkJob = null
         pullJob?.cancel(); pullJob = null
@@ -156,23 +172,49 @@ class SyncEngine(
 
     private suspend fun flushIfNeeded(force: Boolean, maxBatches: Int?) {
         if (!running) return
-        if (!flushMutex.tryLock()) return
+
+        // Use withTimeoutOrNull to prevent indefinite starvation
+        // If we can't acquire the lock within the timeout, log and return
+        val lockAcquired = withTimeoutOrNull(flushLockTimeoutMs) {
+            flushMutex.lock()
+            true
+        }
+
+        if (lockAcquired != true) {
+            // Another flush is in progress - this is expected under high load
+            // The pending data will be flushed on the next cycle
+            return
+        }
+
         try {
+            currentState = SyncState.Flushing(batchesProcessed = 0)
+
             val now = System.currentTimeMillis()
             if (!force) {
                 nextAllowedFlushAtMs?.let { next -> if (now < next) return }
             }
-            networkMonitor?.let { if (!it.isOnline()) return }
+            networkMonitor?.let { if (!it.isOnline()) {
+                currentState = SyncState.Idle
+                return
+            }}
 
             val should = try { shouldFlush(force) } catch (e: Exception) {
-                _events.emit(SyncEngineEvent.UploadFailed(e.message ?: "Unknown error"))
+                val errorMsg = e.message ?: "Unknown error"
+                currentState = SyncState.Error(errorMsg)
+                _events.emit(SyncEngineEvent.UploadFailed(errorMsg))
                 return
             }
-            if (!should) return
+            if (!should) {
+                currentState = SyncState.Idle
+                return
+            }
 
             var batchesProcessed = 0
             while (running) {
-                networkMonitor?.let { if (!it.isOnline()) return }
+                networkMonitor?.let { if (!it.isOnline()) {
+                    currentState = SyncState.Idle
+                    return
+                }}
                 if (maxBatches != null && batchesProcessed >= maxBatches) break
 
                 val pending = store.fetchPendingPoints(batching.maxBatchSize)
@@ -193,16 +235,20 @@ class SyncEngine(
                         store.markFailed(result.rejected.map { it.id }, result.rejected.firstOrNull()?.reason ?: "rejected")
                     }
                     pendingInsertsSinceLastFlush = 0
-                    _events.emit(SyncEngineEvent.UploadSuccess(result.acceptedIds.size, result.rejected.size))
                     batchesProcessed++
+                    currentState = SyncState.Flushing(batchesProcessed)
+                    _events.emit(SyncEngineEvent.UploadSuccess(result.acceptedIds.size, result.rejected.size))
                     maybePruneSentPoints(sentAt)
                     if (result.acceptedIds.isEmpty() && result.rejected.isEmpty()) break
                 } catch (e: Exception) {
                     scheduleBackoffAfterFailure()
-                    _events.emit(SyncEngineEvent.UploadFailed(e.message ?: "Unknown error"))
+                    val errorMsg = e.message ?: "Unknown error"
+                    currentState = SyncState.Backoff(failureCount, nextAllowedFlushAtMs ?: System.currentTimeMillis())
+                    _events.emit(SyncEngineEvent.UploadFailed(errorMsg))
                     break
                 }
             }
+            currentState = SyncState.Idle
         } finally {
             flushMutex.unlock()
         }
